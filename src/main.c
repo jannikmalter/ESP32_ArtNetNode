@@ -24,15 +24,9 @@
 
 #include <string.h>
 
-#include "driver/rmt.h"
-#include "led_strip.h"
-
 #define STORAGE_NAMESPACE "storage"
 
-//FASTLED CONFIG
-#define RMT_TX_CHANNEL RMT_CHANNEL_0
-#define EXAMPLE_CHASE_SPEED_MS (10)
-#define LED_GPIO 2
+
 
 // ETHERNET CONFIG
 #define	PIN_PHY_POWER	16
@@ -58,7 +52,6 @@ uint_fast16_t		offsets[MAX_UNIS+1] = {0,10,20,30,40,50,60,70,80,90,100};
 
 uint_fast8_t newFrame = 0;
 
-led_strip_t *strip;
 
 const char* long_name 		= "Krach vom Fach LED Tube";
 const char* short_name 		= "LED Tube";
@@ -415,11 +408,10 @@ void eth_task()
 						cpy_len = offsets[bufaddress+1] - start_led;	
 						if (cpy_len > DMXlength / 3) cpy_len = DMXlength;
 
- 						for(int i = 0; i < cpy_len; i++)
-							strip->set_pixel(strip, start_led+i, ArtNetBuf[18 + 3*i + 0], ArtNetBuf[18 + 3*i + 1], ArtNetBuf[18 + 3*i + 2]);
- 
-						if (portaddress == DMX_patch[0])
-							strip->refresh(strip, 1000);							
+ 						for(int i = 0; i < cpy_len; i++){};
+							
+						if (portaddress == DMX_patch[0]){};
+														
 					}
 				}
 				else if (opcode == 0x2000 || opcode == 0x6000 || opcode == 0x7000)
@@ -454,36 +446,59 @@ void app_main() {
 	
     // Create default event loop that running in background
     ESP_ERROR_CHECK(esp_event_loop_create_default());
-    esp_netif_config_t cfg = ESP_NETIF_DEFAULT_ETH();
-    esp_netif_t *eth_netif = esp_netif_new(&cfg);
-	
-    // Set default handlers to process TCP/IP stuffs
-    ESP_ERROR_CHECK(esp_eth_set_default_handlers(eth_netif));
-    
-	// Register user defined event handers
-    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP, &got_ip_event_handler, NULL));
 
-    eth_mac_config_t mac_config = ETH_MAC_DEFAULT_CONFIG();
-    eth_phy_config_t phy_config = ETH_PHY_DEFAULT_CONFIG();
-    phy_config.phy_addr = MY_ETH_PHY_ADDR;
-    phy_config.reset_gpio_num = MY_ETH_PHY_RST_GPIO;
-    gpio_pad_select_gpio((gpio_num_t)PIN_PHY_POWER);
-    gpio_set_direction((gpio_num_t)PIN_PHY_POWER,GPIO_MODE_OUTPUT);
+	// Create ETH netif
+    esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
+    esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);
+
+	// --- Ethernet MAC + PHY (ESP32 EMAC + LAN8720 over RMII) ---
+    // Power the PHY (WT32-ETH01 uses a clock-enable / power pin)
+    gpio_config_t io = {
+        .pin_bit_mask = 1ULL << PIN_PHY_POWER,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = 0,
+        .pull_down_en = 0,
+        .intr_type = GPIO_INTR_DISABLE
+    };
+    ESP_ERROR_CHECK(gpio_config(&io));
     gpio_set_level((gpio_num_t)PIN_PHY_POWER, 1);
     vTaskDelay(pdMS_TO_TICKS(10));
-	
-    mac_config.smi_mdc_gpio_num = MY_ETH_MDC_GPIO;
-    mac_config.smi_mdio_gpio_num = MY_ETH_MDIO_GPIO;
-    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&mac_config);
-    esp_eth_phy_t *phy = esp_eth_phy_new_lan8720(&phy_config);
 
-    esp_eth_config_t config = ETH_DEFAULT_CONFIG(mac, phy);
+
+	// Common MAC/PHY configs
+    eth_mac_config_t mac_cfg = ETH_MAC_DEFAULT_CONFIG();
+    eth_phy_config_t phy_cfg = ETH_PHY_DEFAULT_CONFIG();
+    phy_cfg.phy_addr         = MY_ETH_PHY_ADDR;       // usually 0/1 on WT32-ETH01
+    phy_cfg.reset_gpio_num   = MY_ETH_PHY_RST_GPIO;   // -1 if not wired
+
+	// ESP32-specific MAC config: SMI pins and RMII ref clock
+    eth_esp32_emac_config_t esp32_emac_cfg = ETH_ESP32_EMAC_DEFAULT_CONFIG();
+    esp32_emac_cfg.smi_gpio.mdc_num  = MY_ETH_MDC_GPIO;   // WT32-ETH01: 23
+    esp32_emac_cfg.smi_gpio.mdio_num = MY_ETH_MDIO_GPIO;  // WT32-ETH01: 18
+    esp32_emac_cfg.interface = EMAC_DATA_INTERFACE_RMII;
+    // WT32-ETH01 provides external 50 MHz REF_CLK to GPIO0:
+    esp32_emac_cfg.clock_config.rmii.clock_mode = EMAC_CLK_EXT_IN;
+    esp32_emac_cfg.clock_config.rmii.clock_gpio = EMAC_CLK_IN_GPIO; // GPIO0
+
+
+   // Create MAC/PHY instances
+    esp_eth_mac_t *mac = esp_eth_mac_new_esp32(&esp32_emac_cfg, &mac_cfg);
+    esp_eth_phy_t *phy = esp_eth_phy_new_lan87xx(&phy_cfg);
+
+    // Install driver and attach to netif
+    esp_eth_config_t eth_cfg = ETH_DEFAULT_CONFIG(mac, phy);
     esp_eth_handle_t eth_handle = NULL;
-    ESP_ERROR_CHECK(esp_eth_driver_install(&config, &eth_handle));
-    /* attach Ethernet driver to TCP/IP stack */
+    ESP_ERROR_CHECK(esp_eth_driver_install(&eth_cfg, &eth_handle));
     ESP_ERROR_CHECK(esp_netif_attach(eth_netif, esp_eth_new_netif_glue(eth_handle)));
-    /* start Ethernet driver state machine */
+
+    // Register your app handlers (system handlers are auto-registered in v5.x)
+    ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
+                                               &got_ip_event_handler, NULL));
+
+    // Start Ethernet state machine
     ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+    // ------------------------------------------------------------
+
 	
 	
 	// Initialize NVS
@@ -498,22 +513,10 @@ void app_main() {
 	ESP_ERROR_CHECK(err);
 	
 
-	rmt_config_t my_rmt_config = RMT_DEFAULT_CONFIG_TX(LED_GPIO, RMT_TX_CHANNEL);   //CONFIG_EXAMPLE_RMT_TX_GPIO
-    // set counter clock to 40MHz
-    my_rmt_config.clk_div = 2;
-
-    ESP_ERROR_CHECK(rmt_config(&my_rmt_config));
-    ESP_ERROR_CHECK(rmt_driver_install(my_rmt_config.channel, 0, 0));
-
-    
 
 
 
 	load_settings();
-
-	// install ws2812 driver
-    led_strip_config_t strip_config = LED_STRIP_DEFAULT_CONFIG(active_leds, (led_strip_dev_t)my_rmt_config.channel);	
-	strip = led_strip_new_rmt_ws2812(&strip_config);
 
 	xTaskCreatePinnedToCore((TaskFunction_t)eth_task, "eth_task", 2048, NULL, (tskIDLE_PRIORITY), NULL, 1);
     xTaskCreatePinnedToCore((TaskFunction_t)tcp_task, "tcp_task", 2048, NULL, (tskIDLE_PRIORITY+1), NULL, 1);
