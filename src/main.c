@@ -24,15 +24,7 @@
 
 #include <string.h>
 
-#include "driver/rmt.h"
-#include "led_strip.h"
-
 #define STORAGE_NAMESPACE "storage"
-
-//FASTLED CONFIG
-#define RMT_TX_CHANNEL RMT_CHANNEL_0
-#define EXAMPLE_CHASE_SPEED_MS (10)
-#define LED_GPIO 2
 
 // ETHERNET CONFIG
 #define	PIN_PHY_POWER	16
@@ -57,8 +49,6 @@ uint_fast16_t 		DMX_patch[MAX_UNIS] = {0,1,2,3,4,5,6,7,8,9};
 uint_fast16_t		offsets[MAX_UNIS+1] = {0,10,20,30,40,50,60,70,80,90,100};
 
 uint_fast8_t newFrame = 0;
-
-led_strip_t *strip;
 
 const char* long_name 		= "Krach vom Fach LED Tube";
 const char* short_name 		= "LED Tube";
@@ -415,11 +405,8 @@ void eth_task()
 						cpy_len = offsets[bufaddress+1] - start_led;	
 						if (cpy_len > DMXlength / 3) cpy_len = DMXlength;
 
- 						for(int i = 0; i < cpy_len; i++)
-							strip->set_pixel(strip, start_led+i, ArtNetBuf[18 + 3*i + 0], ArtNetBuf[18 + 3*i + 1], ArtNetBuf[18 + 3*i + 2]);
- 
-						if (portaddress == DMX_patch[0])
-							strip->refresh(strip, 1000);							
+						// process ArtNet 
+							
 					}
 				}
 				else if (opcode == 0x2000 || opcode == 0x6000 || opcode == 0x7000)
@@ -497,23 +484,7 @@ void app_main() {
 	}
 	ESP_ERROR_CHECK(err);
 	
-
-	rmt_config_t my_rmt_config = RMT_DEFAULT_CONFIG_TX(LED_GPIO, RMT_TX_CHANNEL);   //CONFIG_EXAMPLE_RMT_TX_GPIO
-    // set counter clock to 40MHz
-    my_rmt_config.clk_div = 2;
-
-    ESP_ERROR_CHECK(rmt_config(&my_rmt_config));
-    ESP_ERROR_CHECK(rmt_driver_install(my_rmt_config.channel, 0, 0));
-
-    
-
-
-
 	load_settings();
-
-	// install ws2812 driver
-    led_strip_config_t strip_config = LED_STRIP_DEFAULT_CONFIG(active_leds, (led_strip_dev_t)my_rmt_config.channel);	
-	strip = led_strip_new_rmt_ws2812(&strip_config);
 
 	xTaskCreatePinnedToCore((TaskFunction_t)eth_task, "eth_task", 2048, NULL, (tskIDLE_PRIORITY), NULL, 1);
     xTaskCreatePinnedToCore((TaskFunction_t)tcp_task, "tcp_task", 2048, NULL, (tskIDLE_PRIORITY+1), NULL, 1);
