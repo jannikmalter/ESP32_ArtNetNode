@@ -616,10 +616,10 @@ void eth_task()
 		{
 			if (strcmp(ArtNetBuf, artnet_header) == 0)
 			{
-				opcode = (ArtNetBuf[9] << 8) | ArtNetBuf[8];
-				if (opcode == 0x5000)
+				opcode = ((uint8_t)ArtNetBuf[9] << 8) | (uint8_t)ArtNetBuf[8];
+				if (opcode == 0x5000 && recv_len >= 18)
 				{
-					portaddress = (ArtNetBuf[15] << 8) | ArtNetBuf[14];
+					portaddress = ((uint8_t)ArtNetBuf[15] << 8) | (uint8_t)ArtNetBuf[14];
 					bufaddress = -1;
 					for (uint_fast8_t i = 0; i < NUM_OUT; i++)
 					{
@@ -631,7 +631,15 @@ void eth_task()
 					}
 					if (bufaddress != -1)
 					{
-						DMXlength = (ArtNetBuf[16] << 8) | ArtNetBuf[17];
+						DMXlength = ((uint8_t)ArtNetBuf[16] << 8) | (uint8_t)ArtNetBuf[17];
+						/* Clamp before the copy: never exceed the 512-byte
+						 * output slot (DMXbuf is NUM_OUT*512), and never read
+						 * past what was actually received (data starts at
+						 * offset 18). recv_len >= 18 is guaranteed above. */
+						if (DMXlength > 512)
+							DMXlength = 512;
+						if (DMXlength > recv_len - 18)
+							DMXlength = recv_len - 18;
 						memcpy(DMXbuf + bufaddress * 512, ArtNetBuf + 18, DMXlength);
 						if (synchronize == 1 && portaddress == sync_addr)
 							trigger = 1;
