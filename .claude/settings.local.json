@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell($pio = Join-Path $env:USERPROFILE \".platformio\\\\penv\\\\Scripts\\\\pio.exe\"; & $pio run -e olimex-rack 2>&1 | Tee-Object -FilePath \"d:\\\\projects\\\\Git\\\\ESP32_ArtNetNode\\\\build_olimex_rack.log\"; \"EXIT_CODE=$LASTEXITCODE\" | Tee-Object -FilePath \"d:\\\\projects\\\\Git\\\\ESP32_ArtNetNode\\\\build_olimex_rack.exit\")",
+      "PowerShell(\"deleted generated sdkconfig.olimex-rack \\(if present\\)\")"
+    ]
+  }
+}

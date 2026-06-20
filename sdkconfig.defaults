@@ -1,0 +1,13 @@
+# sdkconfig.defaults — applied to every env's generated sdkconfig.<env>.
+# These settings are REQUIRED for the software DMX512 bit-bang to be correct
+# and are board-independent (both Olimex and WT32 builds need them).
+
+# DMX timing: the bit-bang busy-waits 960 CPU cycles per bit. 960 cycles only
+# equals one 250 kbaud bit-time (4 us) at 240 MHz, so the CPU must run at 240 MHz.
+CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
+
+# Core 1 is reserved for dmx_task, which holds a critical section forever and
+# never yields to the idle task. Disable the watchdog checks on core 1 so they
+# don't panic/trip; core 0 watchdogs stay enabled.
+CONFIG_ESP_INT_WDT_CHECK_CPU1=n
+CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
