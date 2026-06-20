@@ -338,9 +338,13 @@ void load_dmx_patch()
 void load_sync_state()
 {
 	nvs_handle my_handle;
-	uint8_t sync_load;
-	uint16_t sync_addr_load;
-	uint16_t num_chan_load;
+	/* Initialize to safe defaults: nvs_get_* only writes the destination on
+	 * success, so on a fresh device / after nvs_flash_erase() (keys absent)
+	 * these defaults are kept instead of leaving the values uninitialized.
+	 * Default num_chan to a full 512-channel universe (a valid frame). */
+	uint8_t sync_load = 0;
+	uint16_t sync_addr_load = 0;
+	uint16_t num_chan_load = 512;
 
 	nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle);
 	nvs_get_u8(my_handle, "SYNC_STATE", &sync_load);

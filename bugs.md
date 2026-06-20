@@ -30,19 +30,22 @@ Most of the serious findings (#1, #2, #7) share one root cause: **unvalidated, s
 - Trivial remote DoS over TCP port 1337.
 - **Fix applied:** the command dispatch now starts with an `if (token == NULL)` branch that ignores separator-only lines, and `SYNC` / `SYNC_ADDR` / `NUM_CHAN` each wrap their argument handling in `if (token != NULL)` so a missing argument is ignored rather than dereferenced. A command with no argument now simply re-echoes state with no change.
 
-### 4. `load_sync_state` reads uninitialized stack on first boot
+### 4. `load_sync_state` reads uninitialized stack on first boot — **FIXED**
 - **Where:** [src/main.c:339-354](src/main.c#L339-L354)
 - `sync_load` / `sync_addr_load` / `num_chan_load` are uninitialized locals. NVS return codes are **never checked**, and `nvs_get_*` leaves the destination untouched when a key is missing. On a fresh device or after `nvs_flash_erase()`, `synchronize` / `sync_addr` / `num_chan` get stack garbage → e.g. a garbage `num_chan` makes the frame-length math `(num_chan+1)*11+...` nonsensical (no output / near-zero refresh).
 - Applies to every NVS getter in the file — return values are ignored throughout ([src/main.c:329-354](src/main.c#L329-L354)).
+- **Fix applied:** the three locals are now initialized to safe defaults (`sync_load = 0`, `sync_addr_load = 0`, `num_chan_load = 512`) before the `nvs_get_*` calls. Since `nvs_get_*` only writes its destination on success, a missing key now leaves the default rather than stack garbage. `DMX_patch` in `load_dmx_patch` was already safe (it's a zero-initialized global, so a failed blob read leaves all-zero patches). Note: a *present but out-of-range* stored `num_chan` is still not clamped on load — that's **#11**.
 
 ---
 
 ## Medium severity
 
-### 5. PATCH mutates live DMX state outside the stop/start window
+### 5. PATCH mutates live DMX state outside the stop/start window — **NOT A BUG (by design)**
 - **Where:** [src/main.c:531-532](src/main.c#L531-L532)
-- `save_dmx_patch()` already calls `startDMX()` (clears `stopFlag`) before `update_dmx_ptr()` runs. So `update_dmx_ptr()` — which `memset`s all of `DMXbuf` and rewrites `DMX_repatch[]` — executes while `dmx_task` is live-reading those on core 1. Violates the "never write `DMXbuf`/patch tables while the generator is live" rule; can glitch output on re-patch.
-- The `app_main` call order at [src/main.c:730](src/main.c#L730) is fine (tasks not started yet). Only the TCP path is wrong.
+- `save_dmx_patch()` calls `startDMX()` (clears `stopFlag`) before `update_dmx_ptr()` runs, so `update_dmx_ptr()` — which `memset`s all of `DMXbuf` and rewrites `DMX_repatch[]` — executes while `dmx_task` is live-reading those on core 1.
+- **Verdict (reviewed with author):** intentional and safe. The stop/start window exists specifically to park `dmx_task` for the **NVS/flash** write (flash-cache disable vs. the core-1 critical section), *not* for the repatch. Running `update_dmx_ptr()` live is memory-safe: `DMX_repatch[i]` is always in `[0,6]` and written atomically, so `dmx_task`'s `DMXbuf[512*DMX_repatch[i] + curchan-1]` stays in bounds (max index 3583 < 3584) whichever value wins the race; the `memset` only yields old-or-zero byte values. The only effect is a transient frame on re-patch, which is acceptable for an inherently disruptive operation, and keeping it outside the stop window minimizes output interruption (the author's intent).
+- **Optional polish (not required):** moving `update_dmx_ptr()` *inside* the stop window (stop → write NVS → repatch → start) would make the transition glitch-free at zero extra response-time cost, since the stop window already exists and the repatch is microseconds. Left as-is by choice.
+- The `app_main` call order at [src/main.c:730](src/main.c#L730) is fine (tasks not started yet).
 
 ### 6. ArtPollReply advertises IP 0.0.0.0
 - **Where:** [src/main.c:647](src/main.c#L647)
@@ -88,8 +91,8 @@ Most of the serious findings (#1, #2, #7) share one root cause: **unvalidated, s
 | 1 | High | Art-Net parse | Signed-`char` sign-extension corrupts length/universe — **FIXED** | Yes — full 512-ch frames only |
 | 2 | High | Art-Net parse | No `DMXlength` bounds check before `memcpy` — **FIXED** | Partly — relies on well-formed senders |
 | 3 | High | TCP parser | NULL `strtok` deref on malformed/short commands — **FIXED** | Yes — until a bad command is sent |
-| 4 | High | NVS / boot | Uninitialized vars when NVS keys missing | Yes — keys exist after first config |
-| 5 | Medium | Concurrency | `update_dmx_ptr()` runs after DMX restart | No — happens on every re-patch |
+| 4 | High | NVS / boot | Uninitialized vars when NVS keys missing — **FIXED** | Yes — keys exist after first config |
+| 5 | ~~Medium~~ | Concurrency | `update_dmx_ptr()` runs after DMX restart — **NOT A BUG (by design, memory-safe)** | n/a |
 | 6 | Medium | Art-Net | ArtPollReply reports 0.0.0.0 | Depends on controller |
 | 7 | Medium | Sockets | `recvfrom`/socket errors unhandled (`uint32_t`) | Yes — sockets normally succeed |
 | 8 | Low | Robustness | Unchecked `calloc`/NVS/task-create returns | Yes |
