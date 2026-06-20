@@ -137,6 +137,11 @@ uint_fast8_t trigger = 0;
 
 float refresh_rate;
 
+/* Device IPv4 address in network byte order, captured from
+ * IP_EVENT_ETH_GOT_IP and used to fill the IP field of ArtPollReply.
+ * 0.0.0.0 until DHCP/link assigns one. */
+static volatile uint32_t device_ip = 0;
+
 /** Event handler for Ethernet link events (modern API, board-independent) */
 static void eth_event_handler(void *arg, esp_event_base_t event_base,
                               int32_t event_id, void *event_data)
@@ -157,6 +162,9 @@ static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
 {
 	ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
 	const esp_netif_ip_info_t *ip_info = &event->ip_info;
+
+	/* Stash the assigned address (network byte order) for ArtPollReply. */
+	device_ip = ip_info->ip.addr;
 
 	ESP_LOGI(TAG, "Ethernet Got IP Address");
 	ESP_LOGI(TAG, "~~~~~~~~~~~");
@@ -670,7 +678,8 @@ void eth_task()
 					replyBuf[8] = 0x00;
 					replyBuf[9] = 0x21;
 
-					memcpy(replyBuf + 10, &si_me.sin_addr.s_addr, 4);
+					uint32_t reply_ip = device_ip;   /* real device IP (NBO), 0.0.0.0 until link up */
+					memcpy(replyBuf + 10, &reply_ip, 4);
 
 					replyBuf[14] = 0x36;
 					replyBuf[15] = 0x19;

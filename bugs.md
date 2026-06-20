@@ -47,9 +47,11 @@ Most of the serious findings (#1, #2, #7) share one root cause: **unvalidated, s
 - **Optional polish (not required):** moving `update_dmx_ptr()` *inside* the stop window (stop → write NVS → repatch → start) would make the transition glitch-free at zero extra response-time cost, since the stop window already exists and the repatch is microseconds. Left as-is by choice.
 - The `app_main` call order at [src/main.c:730](src/main.c#L730) is fine (tasks not started yet).
 
-### 6. ArtPollReply advertises IP 0.0.0.0
+### 6. ArtPollReply advertises IP 0.0.0.0 — **FIXED**
 - **Where:** [src/main.c:647](src/main.c#L647)
 - Copies `si_me.sin_addr.s_addr`, but `si_me` is bound to `INADDR_ANY` ([src/main.c:606](src/main.c#L606)) and never updated. The `IP_EVENT_ETH_GOT_IP` handler only logs — it never stores the real IP. Controllers relying on the reply's IP field (rather than the UDP source IP) will see 0.0.0.0.
+- **Not a regression:** `eth_task` and the got-IP handler are byte-for-byte identical to the old OLIMEX firmware, which had the same behavior. It went unnoticed because controllers reach the node via the UDP **source** IP, not this payload field.
+- **Fix applied:** a `device_ip` global (network byte order) is set from `ip_info->ip.addr` in the `IP_EVENT_ETH_GOT_IP` handler, and the ArtPollReply now copies that into bytes 10–13 instead of the always-zero `si_me.sin_addr`. Reads 0.0.0.0 only until the link/DHCP assigns an address.
 
 ### 7. `recvfrom` error not handled
 - **Where:** [src/main.c:614-615](src/main.c#L614-L615)
@@ -93,7 +95,7 @@ Most of the serious findings (#1, #2, #7) share one root cause: **unvalidated, s
 | 3 | High | TCP parser | NULL `strtok` deref on malformed/short commands — **FIXED** | Yes — until a bad command is sent |
 | 4 | High | NVS / boot | Uninitialized vars when NVS keys missing — **FIXED** | Yes — keys exist after first config |
 | 5 | ~~Medium~~ | Concurrency | `update_dmx_ptr()` runs after DMX restart — **NOT A BUG (by design, memory-safe)** | n/a |
-| 6 | Medium | Art-Net | ArtPollReply reports 0.0.0.0 | Depends on controller |
+| 6 | Medium | Art-Net | ArtPollReply reports 0.0.0.0 — **FIXED** | Depends on controller |
 | 7 | Medium | Sockets | `recvfrom`/socket errors unhandled (`uint32_t`) | Yes — sockets normally succeed |
 | 8 | Low | Robustness | Unchecked `calloc`/NVS/task-create returns | Yes |
 | 9 | Low | DMX init | Signed `1 <<` shift | Yes — pins ≤ 17 |
