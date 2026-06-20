@@ -518,7 +518,12 @@ void tcp_task()
 					char *token;
 					token = strtok(inputBuf, " ");
 
-					if (strcmp(token, "PATCH") == 0)
+					if (token == NULL)
+					{
+						/* line was only separators (spaces/CRLF) — ignore */
+					}
+
+					else if (strcmp(token, "PATCH") == 0)
 					{
 						uint_fast8_t i = 0;
 						token = strtok(NULL, " ");
@@ -535,35 +540,44 @@ void tcp_task()
 					else if (strcmp(token, "SYNC") == 0)
 					{
 						token = strtok(NULL, " ");
-						if (strcmp(token, "1") == 0)
-							synchronize = 1;
-						else
-							synchronize = 0;
-						save_sync_state();
+						if (token != NULL)
+						{
+							if (strcmp(token, "1") == 0)
+								synchronize = 1;
+							else
+								synchronize = 0;
+							save_sync_state();
 
-						printf("sync state saved\n");
+							printf("sync state saved\n");
+						}
 					}
 
 					else if (strcmp(token, "SYNC_ADDR") == 0)
 					{
 						token = strtok(NULL, " ");
-						sync_addr = atoi(token);
-						save_sync_state();
+						if (token != NULL)
+						{
+							sync_addr = atoi(token);
+							save_sync_state();
 
-						printf("sync state saved\n");
+							printf("sync state saved\n");
+						}
 					}
 
 					else if (strcmp(token, "NUM_CHAN") == 0)
 					{
 						int input;
 						token = strtok(NULL, " ");
-						input = atoi(token);
-						if (1>input) input = 1;
-						if (512<input) input = 512;
-						num_chan = input;
-						save_sync_state();
+						if (token != NULL)
+						{
+							input = atoi(token);
+							if (1>input) input = 1;
+							if (512<input) input = 512;
+							num_chan = input;
+							save_sync_state();
 
-						printf("sync state saved\n");
+							printf("sync state saved\n");
+						}
 					}
 				}
 

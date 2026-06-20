@@ -22,12 +22,13 @@ Most of the serious findings (#1, #2, #7) share one root cause: **unvalidated, s
 - Unauthenticated network input → memory corruption. Directly contradicts CLAUDE.md's "bounds-checked buffer math" priority.
 - **Fix applied:** the ArtDMX branch is now guarded by `recv_len >= 18` (so the length/universe fields are actually present), and `DMXlength` is clamped to `512` and then to `recv_len - 18` before the `memcpy`. The `512` clamp runs first and is the hard safety net — it caps the copy at the slot size even if `recv_len` is bogus (see **#7**), so `DMXbuf` can no longer overflow; the `recv_len - 18` clamp additionally prevents copying stale bytes from a truncated packet.
 
-### 3. TCP command parser dereferences NULL `strtok` results
+### 3. TCP command parser dereferences NULL `strtok` results — **FIXED**
 - **Where:** [src/main.c:519-560](src/main.c#L519-L560)
 - A line starting with a space passes the `inputBuf[0] != 0` guard but `strtok` returns NULL → `strcmp(NULL, "PATCH")` at [src/main.c:521](src/main.c#L521) crashes.
 - `SYNC` / `SYNC_ADDR` / `NUM_CHAN` with **no argument**: `strtok(NULL, " ")` returns NULL → `strcmp(NULL, "1")` ([src/main.c:538](src/main.c#L538)) / `atoi(NULL)` ([src/main.c:550](src/main.c#L550), [src/main.c:560](src/main.c#L560)) crash.
 - `PATCH` is safe — its `while (token != NULL)` loop guards itself.
 - Trivial remote DoS over TCP port 1337.
+- **Fix applied:** the command dispatch now starts with an `if (token == NULL)` branch that ignores separator-only lines, and `SYNC` / `SYNC_ADDR` / `NUM_CHAN` each wrap their argument handling in `if (token != NULL)` so a missing argument is ignored rather than dereferenced. A command with no argument now simply re-echoes state with no change.
 
 ### 4. `load_sync_state` reads uninitialized stack on first boot
 - **Where:** [src/main.c:339-354](src/main.c#L339-L354)
@@ -86,7 +87,7 @@ Most of the serious findings (#1, #2, #7) share one root cause: **unvalidated, s
 |---|---|---|---|---|
 | 1 | High | Art-Net parse | Signed-`char` sign-extension corrupts length/universe — **FIXED** | Yes — full 512-ch frames only |
 | 2 | High | Art-Net parse | No `DMXlength` bounds check before `memcpy` — **FIXED** | Partly — relies on well-formed senders |
-| 3 | High | TCP parser | NULL `strtok` deref on malformed/short commands | Yes — until a bad command is sent |
+| 3 | High | TCP parser | NULL `strtok` deref on malformed/short commands — **FIXED** | Yes — until a bad command is sent |
 | 4 | High | NVS / boot | Uninitialized vars when NVS keys missing | Yes — keys exist after first config |
 | 5 | Medium | Concurrency | `update_dmx_ptr()` runs after DMX restart | No — happens on every re-patch |
 | 6 | Medium | Art-Net | ArtPollReply reports 0.0.0.0 | Depends on controller |
