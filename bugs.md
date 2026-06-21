@@ -61,16 +61,19 @@ Most of the serious findings (#1, #2, #7) share one root cause: **unvalidated, s
 
 ## Low / latent / robustness
 
-### 8. Unchecked allocations & return values
+### 8. Unchecked allocations & return values — **FIXED**
 - `calloc` results (`DMXbuf` and the four task buffers) are never NULL-checked; `nvs_open`, `xTaskCreatePinnedToCore`, and `esp_netif_new` returns are ignored. Low probability, but a NULL `DMXbuf` would fault the DMX core immediately.
+- **Fix applied:** the boot-critical allocations/inits (`DMXbuf`, `esp_netif_new`, the two task buffers in `tcp_task`/`eth_task`, and all three `xTaskCreatePinnedToCore` calls) now log `ESP_LOGE` and `esp_restart()` on failure — a restart loop is preferable to running with a NULL buffer or a missing DMX core. The four `nvs_open` calls are now checked: the **save** paths (`save_dmx_patch`/`save_sync_state`) call `startDMX()` before returning so a failed write never leaves DMX parked; the **load** paths keep their safe defaults (`load_dmx_patch` keeps the zero-init global patch, `load_sync_state` keeps `0/0/512`). Added `#include "esp_system.h"` for `esp_restart()`.
 
-### 9. Signed shift in GPIO bitmask build
+### 9. Signed shift in GPIO bitmask build — **FIXED**
 - **Where:** [src/main.c:194-195](src/main.c#L194-L195)
 - `1 << GPIO_patch[j]` is a signed shift — fine for the current pins (≤ 17) but should be `1u <<`; would be UB at pin 31.
+- **Fix applied:** the bitmask build is now `1u << GPIO_patch[j]`, so the shift is on an `unsigned int` and well-defined for any pin 0–31. (The `outputH`/`outputL` build a few lines down also shifts by `GPIO_patch[i]`, but its left operand is already `0` or `1` and the pins are fixed ≤ 17 — left as-is to keep the fix scoped to the flagged expression.)
 
-### 10. Read-modify-write on write-1-to-set registers
+### 10. Read-modify-write on write-1-to-set registers — **FIXED**
 - **Where:** [src/main.c:273-274](src/main.c#L273-L274)
 - `*GPIO_w1ts |= outputH` / `*GPIO_w1tc |= outputL` work (safe inside the critical section) but a plain `=` is the idiomatic, cheaper form for W1TS/W1TC registers.
+- **Fix applied:** both writes are now plain `=` (`*GPIO_w1ts = outputH; *GPIO_w1tc = outputL;`). W1TS/W1TC only act on the `1` bits written (a `0` is inert), and the masks are recomputed in full each bit-time, so the read in `|=` was pure overhead in the tightest loop of the firmware — dropping it removes a bus read per bit with identical behavior.
 
 ### 11. `num_chan` only clamped in the TCP setter
 - **Where:** [src/main.c:561-562](src/main.c#L561-L562)
@@ -80,9 +83,15 @@ Most of the serious findings (#1, #2, #7) share one root cause: **unvalidated, s
 - **Where:** [src/main.c:490](src/main.c#L490), [src/main.c:654-655](src/main.c#L654-L655)
 - A `mini` build still announces itself as "Rack" in the ArtPollReply and TCP banner. Already documented as a known wart in CLAUDE.md — not a regression. Fix by parameterizing on `VARIANT_NAME`.
 
-### 13. Tick-vs-ms inconsistency in delays
+### 13. Tick-vs-ms inconsistency in delays — **FIXED**
 - **Where:** `eth_task` `vTaskDelay(100)` ([src/main.c:613](src/main.c#L613)) vs `stopDMX` `vTaskDelay(100 / portTICK_PERIOD_MS)` ([src/main.c:298](src/main.c#L298))
 - `vTaskDelay(100)` is 100 ticks = 1 s at `FREERTOS_HZ=100`, while the other is 100 ms. Harmless (just a reconfig pause) but inconsistent.
+- **Fix applied:** `eth_task`'s reconfig-pause poll is now `vTaskDelay(1)` (one tick = 10 ms), matching `dmx_task`'s own stop-poll, so ingest resumes within ~10 ms of `startDMX()` instead of up to 1 s. `stopDMX` no longer uses a fixed delay at all — see **#14**.
+
+### 14. `stopDMX` parked-state sync was a timing assumption, not a handshake — **FIXED**
+- **Where:** `stopDMX` ([src/main.c:303-306](src/main.c#L303-L306)), `dmx_task` stop branch ([src/main.c:219-229](src/main.c#L219-L229)), `stopFlag`/`trigger` globals ([src/main.c:132](src/main.c#L132), [src/main.c:137](src/main.c#L137))
+- `stopDMX` set `stopFlag = 1` then slept a fixed `vTaskDelay(100 ms)` and *assumed* `dmx_task` had left `vPortExitCritical` by then, before the caller (`tcp_task`) wrote NVS. Writing flash while `dmx_task` is still in its critical section (interrupts off, running from cache) risks a crash on the cache-disable/cross-core stall. Safe in practice only by margin (`dmx_task` checks `stopFlag` every ~4 µs, so 100 ms was ~25,000× headroom). Separately, `stopFlag`/`trigger` were plain `uint_fast8_t` shared across tasks — not `volatile`, so technically liable to be register-cached (worked only because the poll loops contain `vTaskDelay` the compiler can't see through).
+- **Fix applied:** added a `volatile dmxStopped` ack flag that `dmx_task` raises right after `vPortExitCritical` and clears when it re-enters the critical section. `stopDMX` now clears `dmxStopped`, sets `stopFlag`, and polls `while (!dmxStopped) vTaskDelay(1)` (with a 50-tick failsafe so a wedged `dmx_task` can't hang the config interface) — a real wait-for-exit instead of a fixed guess, and it resumes within ~1 tick instead of always 100 ms. Clearing the ack *before* setting `stopFlag` ensures a fresh ack is awaited, closing the back-to-back-stop race. `stopFlag`, `dmxStopped`, and `trigger` are now `volatile`.
 
 ---
 
@@ -97,9 +106,10 @@ Most of the serious findings (#1, #2, #7) share one root cause: **unvalidated, s
 | 5 | ~~Medium~~ | Concurrency | `update_dmx_ptr()` runs after DMX restart — **NOT A BUG (by design, memory-safe)** | n/a |
 | 6 | Medium | Art-Net | ArtPollReply reports 0.0.0.0 — **FIXED** | Depends on controller |
 | 7 | Medium | Sockets | `recvfrom`/socket errors unhandled (`uint32_t`) | Yes — sockets normally succeed |
-| 8 | Low | Robustness | Unchecked `calloc`/NVS/task-create returns | Yes |
-| 9 | Low | DMX init | Signed `1 <<` shift | Yes — pins ≤ 17 |
-| 10 | Low | DMX core | `|=` on W1TS/W1TC instead of `=` | Yes — works as-is |
+| 8 | Low | Robustness | Unchecked `calloc`/NVS/task-create returns — **FIXED** | Yes |
+| 9 | Low | DMX init | Signed `1 <<` shift — **FIXED** | Yes — pins ≤ 17 |
+| 10 | Low | DMX core | `|=` on W1TS/W1TC instead of `=` — **FIXED** | Yes — works as-is |
 | 11 | Low | NVS | `num_chan` not clamped on load | Tied to #4 |
 | 12 | Low | Cosmetic | Hardcoded "Rack" name | Cosmetic |
-| 13 | Low | Timing | `vTaskDelay` tick-vs-ms inconsistency | Harmless |
+| 13 | Low | Timing | `vTaskDelay` tick-vs-ms inconsistency — **FIXED** | Harmless |
+| 14 | Low | Concurrency | `stopDMX` timing-assumption + non-`volatile` flags — **FIXED** | Yes — by timing margin |

@@ -24,6 +24,7 @@
 #include "esp_eth.h"
 #include "esp_event.h"
 #include "esp_log.h"
+#include "esp_system.h"
 #include "sdkconfig.h"
 
 #include "driver/gpio.h"
@@ -128,12 +129,20 @@ uint8_t *DMXbuf;
 uint_fast16_t DMX_patch[NUM_OUT] = {0, 0, 0, 0, 0, 0, 0};
 uint_fast8_t DMX_repatch[NUM_OUT] = {0, 0, 0, 0, 0, 0, 0};
 
-uint_fast8_t stopFlag = 0;
+/* Cross-task reconfiguration handshake (no locks):
+ *   stopFlag   - set by tcp_task (via stopDMX), polled by dmx_task & eth_task.
+ *   dmxStopped - set by dmx_task once it has left vPortExitCritical and is
+ *                idling; lets stopDMX *observe* the critical-section exit
+ *                instead of assuming a fixed delay was long enough.
+ * Both are written by one task and read by another, so they must be volatile
+ * or the compiler may cache them in a register and never see the change. */
+volatile uint_fast8_t stopFlag = 0;
+volatile uint_fast8_t dmxStopped = 0;
 
 uint_fast8_t synchronize = 0;
 uint_fast16_t sync_addr = 0;
 uint_fast16_t num_chan = 0;
-uint_fast8_t trigger = 0;
+volatile uint_fast8_t trigger = 0;
 
 float refresh_rate;
 
@@ -199,7 +208,7 @@ void dmx_task()
 
 	uint32_t bitmask = 0;
 	for (uint_fast8_t j = 0; j < NUM_OUT; j++)
-		bitmask |= 1 << GPIO_patch[j];
+		bitmask |= 1u << GPIO_patch[j];
 
 	gpio_config_t io_conf;
 	io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -218,10 +227,12 @@ void dmx_task()
 		if (stopFlag)
 		{
 			vPortExitCritical(&myMutex);
+			dmxStopped = 1;       /* ack: critical section released, safe to write flash */
 			while (stopFlag)
-				vTaskDelay(10);
+				vTaskDelay(1);
 
 			vPortEnterCritical(&myMutex);
+			dmxStopped = 0;       /* back in the critical section */
 			curbit = 0;
 			Cold = xthal_get_ccount();
 			last_frame = Cold;
@@ -277,8 +288,8 @@ void dmx_task()
 		{
 		};
 
-		*GPIO_w1ts |= outputH;
-		*GPIO_w1tc |= outputL;
+		*GPIO_w1ts = outputH;
+		*GPIO_w1tc = outputL;
 		Cold += 960;
 
 		curbit++;
@@ -301,8 +312,17 @@ void startDMX()
 
 void stopDMX()
 {
+	/* Clear the ack first so we wait for a *fresh* one raised after this
+	 * stopFlag set — never a stale ack left over from the previous stop. */
+	dmxStopped = 0;
 	stopFlag = 1;
-	vTaskDelay(100 / portTICK_PERIOD_MS);
+	/* Wait until dmx_task has actually left vPortExitCritical (it sets
+	 * dmxStopped right after) before the caller writes flash. This is a real
+	 * handshake, not a fixed-delay assumption: dmx_task checks stopFlag every
+	 * bit-time (~4 us) so this normally returns within a tick. The timeout is a
+	 * failsafe so a wedged dmx_task can never hang the config interface. */
+	for (uint_fast8_t i = 0; !dmxStopped && i < 50; i++)
+		vTaskDelay(1);
 }
 
 void save_dmx_patch()
@@ -310,7 +330,12 @@ void save_dmx_patch()
 	stopDMX();
 
 	nvs_handle my_handle;
-	nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle);
+	if (nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle) != ESP_OK)
+	{
+		ESP_LOGE(TAG, "save_dmx_patch: nvs_open failed");
+		startDMX();   /* never leave DMX parked on a failed save */
+		return;
+	}
 	nvs_set_blob(my_handle, "DMXPATCH", DMX_patch, NUM_OUT * sizeof(uint_fast16_t));
 	nvs_commit(my_handle);
 	nvs_close(my_handle);
@@ -323,7 +348,12 @@ void save_sync_state()
 	stopDMX();
 
 	nvs_handle my_handle;
-	nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle);
+	if (nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle) != ESP_OK)
+	{
+		ESP_LOGE(TAG, "save_sync_state: nvs_open failed");
+		startDMX();   /* never leave DMX parked on a failed save */
+		return;
+	}
 	nvs_set_u8(my_handle, "SYNC_STATE", (uint8_t)synchronize);
 	nvs_set_u16(my_handle, "SYNC_ADDR", (uint16_t)sync_addr);
 	nvs_set_u16(my_handle, "NUM_CHAN", (uint16_t)num_chan);
@@ -337,7 +367,11 @@ void load_dmx_patch()
 {
 	nvs_handle my_handle;
 
-	nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle);
+	if (nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle) != ESP_OK)
+	{
+		ESP_LOGE(TAG, "load_dmx_patch: nvs_open failed, keeping zero patch");
+		return;   /* DMX_patch is a zero-initialized global */
+	}
 	size_t required_size = NUM_OUT * sizeof(uint_fast16_t);
 	nvs_get_blob(my_handle, "DMXPATCH", DMX_patch, &required_size);
 	nvs_close(my_handle);
@@ -354,11 +388,17 @@ void load_sync_state()
 	uint16_t sync_addr_load = 0;
 	uint16_t num_chan_load = 512;
 
-	nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle);
-	nvs_get_u8(my_handle, "SYNC_STATE", &sync_load);
-	nvs_get_u16(my_handle, "SYNC_ADDR", &sync_addr_load);
-	nvs_get_u16(my_handle, "NUM_CHAN", &num_chan_load);
-	nvs_close(my_handle);
+	if (nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle) != ESP_OK)
+	{
+		ESP_LOGE(TAG, "load_sync_state: nvs_open failed, keeping defaults");
+	}
+	else
+	{
+		nvs_get_u8(my_handle, "SYNC_STATE", &sync_load);
+		nvs_get_u16(my_handle, "SYNC_ADDR", &sync_addr_load);
+		nvs_get_u16(my_handle, "NUM_CHAN", &num_chan_load);
+		nvs_close(my_handle);
+	}
 
 	synchronize = (uint_fast8_t)sync_load;
 	sync_addr = (uint_fast16_t)sync_addr_load;
@@ -441,6 +481,11 @@ void tcp_task()
 
 	inputBuf = calloc(BUFLEN, sizeof(char));
 	replyBuf = calloc(BUFLEN, sizeof(char));
+	if (inputBuf == NULL || replyBuf == NULL)
+	{
+		ESP_LOGE(TAG, "tcp_task: buffer alloc failed");
+		esp_restart();
+	}
 
 	while (1)
 	{
@@ -623,6 +668,11 @@ void eth_task()
 
 	ArtNetBuf = calloc(BUFLEN, sizeof(char));
 	replyBuf = calloc(BUFLEN, sizeof(char));
+	if (ArtNetBuf == NULL || replyBuf == NULL)
+	{
+		ESP_LOGE(TAG, "eth_task: buffer alloc failed");
+		esp_restart();
+	}
 
 	s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
 
@@ -635,7 +685,7 @@ void eth_task()
 	while (1)
 	{
 		while (stopFlag)
-			vTaskDelay(100);
+			vTaskDelay(1);
 
 		recv_len = recvfrom(s, ArtNetBuf, BUFLEN, 0, (struct sockaddr *)&si_other, &slen);
 		if (recv_len >= 10)
@@ -706,6 +756,11 @@ void app_main(void)
 	/* --- Ethernet netif --- */
 	esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
 	esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);
+	if (eth_netif == NULL)
+	{
+		ESP_LOGE(TAG, "esp_netif_new failed");
+		esp_restart();
+	}
 
 	/* --- Power the PHY (board-specific enable GPIO) --- */
 	gpio_config_t phy_pwr = {
@@ -760,13 +815,22 @@ void app_main(void)
 
 	/* --- DMX buffer + persisted settings --- */
 	DMXbuf = calloc(NUM_OUT * 512, sizeof(uint8_t));
+	if (DMXbuf == NULL)
+	{
+		ESP_LOGE(TAG, "DMXbuf alloc failed");
+		esp_restart();
+	}
 
 	load_dmx_patch();
 	update_dmx_ptr();
 	load_sync_state();
 
 	/* --- Tasks: network on core 0, DMX bit-bang alone on core 1 --- */
-	xTaskCreatePinnedToCore(eth_task, "eth_task", 2048, NULL, (tskIDLE_PRIORITY + 2), NULL, 0);
-	xTaskCreatePinnedToCore(tcp_task, "tcp_task", 2048, NULL, (tskIDLE_PRIORITY), NULL, 0);
-	xTaskCreatePinnedToCore(dmx_task, "dmx_task", 2018, NULL, (configMAX_PRIORITIES - 1), NULL, 1);
+	if (xTaskCreatePinnedToCore(eth_task, "eth_task", 2048, NULL, (tskIDLE_PRIORITY + 2), NULL, 0) != pdPASS ||
+	    xTaskCreatePinnedToCore(tcp_task, "tcp_task", 2048, NULL, (tskIDLE_PRIORITY), NULL, 0) != pdPASS ||
+	    xTaskCreatePinnedToCore(dmx_task, "dmx_task", 2018, NULL, (configMAX_PRIORITIES - 1), NULL, 1) != pdPASS)
+	{
+		ESP_LOGE(TAG, "task create failed");
+		esp_restart();
+	}
 }
