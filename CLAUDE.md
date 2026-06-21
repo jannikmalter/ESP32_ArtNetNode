@@ -130,7 +130,9 @@ pio run -t clean
 pio run -e olimex-rack -t menuconfig # edit that env's sdkconfig
 ```
 
-Each env gets its own generated `sdkconfig.<env>`, seeded by the shared [sdkconfig.defaults](sdkconfig.defaults) (see below). On Windows, PlatformIO's venv may need to be on PATH (`%USERPROFILE%\.platformio\penv\Scripts`) or use the VS Code PlatformIO toolbar.
+Each env gets its own generated `sdkconfig.<env>`, seeded by the shared [sdkconfig.defaults](sdkconfig.defaults) (see below). `pio` is often not on `PATH`: on this Linux box it lives at `~/.platformio/penv/bin/pio` (invoke with the full path); on Windows the venv is `%USERPROFILE%\.platformio\penv\Scripts` — add it to PATH or use the VS Code PlatformIO toolbar.
+
+A `pio run` prints a benign `Flash memory size mismatch … Expected 4MB, found 2MB!` warning: the `esp32-poe` board manifest declares the chip's real 4 MB, while `sdkconfig.*` pins `CONFIG_ESPTOOLPY_FLASHSIZE="2MB"`. Harmless (the firmware uses ~38% of the 1 MB app partition) and matches the deployed config — not an error.
 
 ## sdkconfig: what DMX timing requires
 
