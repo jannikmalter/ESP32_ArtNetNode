@@ -324,7 +324,7 @@ src/main.c            # the entire firmware (DMX engine, Art-Net, TCP, NVS, Ethe
 platformio.ini        # 4 build envs (2 boards x 2 variants)
 sdkconfig.defaults    # board-independent DMX-timing config, seeds every env
 CMakeLists.txt        # ESP-IDF project glue
-requirements.md       # functional requirements
+reqs.md               # requirements, goals, bugs, TODOs (single source of truth)
 art-net.pdf           # Art-Net protocol reference
 CLAUDE.md             # engineering notes / port history
 ```

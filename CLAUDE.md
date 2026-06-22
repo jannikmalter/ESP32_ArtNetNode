@@ -14,7 +14,7 @@ Firmware that turns an **ESP32 Ethernet board** into an **Art-Net → DMX512 nod
 
 **Reliability and performance are the top priorities** (it drives live lighting). No external libraries — the firmware talks to ESP-IDF directly.
 
-Spec: [requirements.md](requirements.md). Protocol reference: [art-net.pdf](art-net.pdf).
+Spec: [reqs.md](reqs.md) (requirements, goals, bugs, TODOs). Protocol reference: [art-net.pdf](art-net.pdf).
 
 ## How the firmware is structured
 
