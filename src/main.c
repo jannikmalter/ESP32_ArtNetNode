@@ -241,9 +241,6 @@ void dmx_task()
 		outbuf = 0b00000000;
 		if (curbit < BREAK)
 		{
-			if (synchronize == 1)
-				if ((trigger == 0) && (xthal_get_ccount() - last_frame < 50000000))
-					curbit--;
 		}
 
 		else if (curbit < BREAK + MAB)
@@ -296,11 +293,16 @@ void dmx_task()
 
 		if (curbit >= (num_chan + 1) * 11 + BREAK + MAB)  /* 450 */
 		{
-			trigger = 0;
-			curbit = 0;
-			new_frame = xthal_get_ccount();
-			refresh_rate = 1 / ((float)(new_frame - last_frame) * 0.000000004166666);
-			last_frame = new_frame;
+			if ((synchronize == 1) && (trigger == 0) && (xthal_get_ccount() - last_frame < 50000000))
+				curbit--;
+			else
+			{
+				trigger = 0;
+				curbit = 0;
+				new_frame = xthal_get_ccount();
+				refresh_rate = 1 / ((float)(new_frame - last_frame) * 0.000000004166666);
+				last_frame = new_frame;
+			}
 		}
 	}
 }

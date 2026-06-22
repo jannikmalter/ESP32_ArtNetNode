@@ -44,7 +44,8 @@ Status values:
 | R10 | Watchdog and scheduler held off on the DMX core | Completed | `vPortEnterCritical` + INT/TASK WDT on CPU1 disabled |
 | R11 | 250 kbaud, timing by CPU cycle counting | Completed | 960 cycles/bit at 240 MHz |
 | R12 | Adjustable channel count to raise frame rate | Completed | `NUM_CHAN` 1..512 |
-| R13 | DMX sync to a selected input universe, or free-run | Completed | `synchronize` / `sync_addr` / `trigger` |
+| R13 | DMX sync to a selected input universe, or free-run | Completed | `synchronize` / `sync_addr` / `trigger`; sync reliability reworked in R24 |
+| R24 | Rework DMX sync into a "new data" flag with clear-before-send semantics: set the flag when a sync-universe ArtDMX packet is processed or an ArtSync packet (0x5200) arrives; `dmx_task` waits for the flag and clears it before sending each frame, so a packet arriving mid-frame is not lost | Open | reworks R13; current `trigger` stalls in BREAK ([src/main.c:244-246](src/main.c#L244-L246)) and clears after the frame ([src/main.c:299](src/main.c#L299)), dropping late packets; adds ArtSync (OpSync 0x5200) handling in `eth_task`; keep the ~0.2 s failsafe timeout; see T9 |
 
 ### 2.3 Art-Net & network
 
@@ -140,3 +141,4 @@ Audit of `src/main.c` against the committed baseline. Severity and "masked"
 | T6 | Optional: move `update_dmx_ptr()` inside the stop/start window for glitch-free re-patch | B5 | Optional |
 | T7 | Implement native Art-Net config/query: ArtAddress (set + persist universe patch and node name), full ArtPollReply (per-port universes, name, status), optional ArtInput (0x7000); read [art-net.pdf](art-net.pdf) | R22 | Medium |
 | T8 | Build minimal web UI: one `esp_http_server` config page (patch, sync, sync universe, channels/output + live refresh), reuse the NVS handshake, decide TCP CLI removal | R23 | Medium |
+| T9 | Rework sync: replace `trigger` with a "new data" flag set on sync-universe ArtDMX and on ArtSync (0x5200); in `dmx_task` wait for the flag and clear it at frame start (before send); keep the failsafe timeout | R24 | High |
