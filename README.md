@@ -324,15 +324,18 @@ src/main.c            # the entire firmware (DMX engine, Art-Net, TCP, NVS, Ethe
 platformio.ini        # 4 build envs (2 boards x 2 variants)
 sdkconfig.defaults    # board-independent DMX-timing config, seeds every env
 CMakeLists.txt        # ESP-IDF project glue
-reqs.md               # requirements, goals, bugs, TODOs (single source of truth)
-art-net.pdf           # Art-Net protocol reference
-CLAUDE.md             # engineering notes / port history
+reqs.md               # requirements, goals, bugs (single source of truth)
+reqs/                 # per-item detail files (reqs/<ID>.md)
+todo.md               # development plan (T1-T9)
+info.md               # internal how-the-code-works documentation
+docs/                 # bulky reference (art-net.pdf, ANSI E1.11 DMX512 standard)
+CLAUDE.md             # minimal LLM-specific notes + imports
 ```
 
 `src/main.c` is a single translation unit. The DMX/Art-Net/TCP/NVS logic was
 ported verbatim from the original OLIMEX ESP32-POE firmware (ESP-IDF ~v4.0); the
 Ethernet bring-up was modernized to the ESP-IDF v5 API and parameterized for two
-boards. See [CLAUDE.md](CLAUDE.md) for port details.
+boards. See [info.md](info.md) for port details.
 
 ---
 
