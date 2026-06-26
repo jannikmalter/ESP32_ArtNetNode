@@ -14,8 +14,11 @@ hardware actually built so far) and WT32-ETH01.**
 
 - Receives Art-Net DMX data over **UDP via wired Ethernet**.
 - Generates **DMX512 output on seven GPIO pins** via software bit-banging.
-- Configurable at runtime over a **web UI** (the former raw TCP CLI was removed).
-- Responds to **ArtPoll** discovery so it appears in lighting controllers.
+- Configurable at runtime over a **web UI** (the former raw TCP CLI was removed)
+  and natively over **Art-Net** (ArtAddress sets the per-output universe patch and
+  node name; ArtPollReply reports them — R22).
+- Responds to **ArtPoll** discovery so it appears in lighting controllers,
+  advertising each output as its own bound port with an independent universe.
 - Persists configuration to **NVS** (non-volatile storage).
 
 **Reliability and performance are the top priorities** (it drives live lighting).
@@ -362,7 +365,7 @@ OTA upload endpoint (**R26**). The raw TCP CLI it replaced was **removed**
 | Route | Method | Effect |
 |---|---|---|
 | `/` | GET | serves the embedded config page (`index_html`) |
-| `/api/state` | GET | flat JSON: fw/board/variant, `patch[7]`, `sync`, `sync_addr`, `num_chan`, live `refresh`, live `pps`, live `load0` |
+| `/api/state` | GET | flat JSON: fw/board/variant, `name`, `patch[7]`, `sync`, `sync_addr`, `num_chan`, live `refresh`, live `pps`, live `load0` |
 | `/api/config` | POST | query params `patch=a,b,…,g` · `sync=0\|1` · `sync_addr=n` · `num_chan=n` (any subset); applies + returns fresh state |
 | `/api/ota` | POST | raw firmware image (octet-stream body) → inactive OTA slot → reboot; see [Firmware update (OTA)](#firmware-update-ota) |
 
@@ -413,17 +416,55 @@ indirection exists because PlatformIO's SCons build does **not** link IDF's
 to _binary_index_html_start`). The script approach also extends to future assets
 (e.g. an OTA page): emit more arrays from the same source dir.
 
+## Native Art-Net configuration & query (R22)
+
+Standard lighting controllers can discover and configure the node over Art-Net,
+not just via the web UI. Handled in `eth_task`'s opcode dispatch
+([src/main.c](src/main.c)), reusing the same `stopDMX()` → NVS → `startDMX()`
+handshake as `/api/config`.
+
+**Port-Address model (Art-Net 4 per-port binding).** A 15-bit Port-Address =
+`NetSwitch(7) : SubSwitch(4) : Sw(4)`. A single ArtPollReply/ArtAddress carries
+one Net + one Sub but four Sw nibbles, so the legacy scheme could only describe 4
+ports sharing one block of 16 universes. Art-Net 4 instead encodes **one universe
+per ArtPollReply** (`NumPortsLo=1`), differentiated by `BindIndex` (1..N) + `BindIp`
+(see [docs/art-net.pdf](docs/art-net.pdf) p.149, p.4486-4489). So the node sends
+**NUM_OUT (7) ArtPollReply packets**, BindIndex 1..7, each advertising one output's
+fully independent universe — every output can have any universe.
+
+- **ArtPoll (`0x2000`)** → `send_artpollreply()` emits the 7 per-port replies
+  (unicast to the poller). Each fills NetSwitch/SubSwitch/SwOut from `DMX_patch[k]`,
+  `PortTypes[0]=0x80` (output/DMX512), `GoodOutputA[0]=0x80`, the ShortName/LongName,
+  MAC (`esp_read_mac`), BindIp/BindIndex, and Status1/Status2. Reply length 239
+  (≥ the 207-byte minimum).
+- **ArtAddress (`0x6000`)** → `handle_artaddress()`. `BindIndex` selects the output
+  (`idx = bind<=1 ? 0 : bind-1`). The new universe is rebuilt from the current one,
+  replacing only the Net/Sub/Sw sub-fields whose source byte has **bit7 set** (spec:
+  "ignored unless bit 7 is high"), so a partial program never zeroes a universe.
+  PortName (offset 14) / LongName (offset 32) are applied if their first byte is
+  non-null. Changes persist (`save_dmx_patch` + `update_dmx_ptr`, `save_node_name`),
+  then the node replies with ArtPollReply. **Any Art-Net patch change also resets
+  sync mode and `num_chan` to defaults** (free-run, 512 channels) — those can't be
+  set over Art-Net, so resetting them keeps an Art-Net-only configured node from
+  silently retaining stale web-UI values the user can't see from a controller. The `Command` byte (LED/merge/failsafe
+  ops) is accepted but not acted on (output-only node). Guarded by `recv_len >= 107`.
+- **ArtInput (`0x7000`)** is **not** handled — the node has no DMX inputs. The
+  pre-R22 firmware mis-used `0x6000`/`0x7000` as extra ArtPoll triggers; removed.
+
 ## Constants & wire format
 
 - Art-Net UDP port **6454** (`PORT`); web UI on port **80**; socket buffer **1024**
   (`BUFLEN`).
 - DMX timing: `BREAK` 30, `MAB` 10 bit-times; 11 bit-times/channel; 960 cycles/bit.
 - Art-Net opcodes (little-endian on the wire — note byte-swapped reads like
-  `(buf[9]<<8)|buf[8]`): ArtDMX `0x5000`; ArtPoll `0x2000`/`0x6000`/`0x7000` →
-  ArtPollReply `0x2100`. ArtDMX payload: length at bytes 16–17, data from byte 18;
-  universe (port-address) at bytes 14–15.
+  `(buf[9]<<8)|buf[8]`; `#define`d as `OP_*` in [src/main.c](src/main.c)): ArtDMX
+  `0x5000`; ArtPoll `0x2000` → ArtPollReply `0x2100`; ArtAddress `0x6000`
+  (remote config, R22); ArtInput `0x7000` (unhandled — output-only node). ArtDMX
+  payload: length at bytes 16–17, data from byte 18; universe (port-address) at
+  bytes 14–15. (The pre-R22 firmware mis-used `0x6000`/`0x7000` as extra ArtPoll
+  triggers; that quirk is gone.)
 - NVS namespace `"storage"`. Keys: `DMXPATCH` (blob), `SYNC_STATE` (u8),
-  `SYNC_ADDR` (u16), `NUM_CHAN` (u16).
+  `SYNC_ADDR` (u16), `NUM_CHAN` (u16), `SHORTNAME` (str), `LONGNAME` (str).
 
 ## Toolchain facts
 
@@ -439,9 +480,10 @@ to _binary_index_html_start`). The script approach also extends to future assets
   `"ArtNetNode"` in `src/main.c`). Match surrounding style.
 - **Endianness:** Art-Net is little-endian; the manual byte assembly is
   intentional — keep it consistent.
-- **Known wart:** the ArtPollReply node name is still hardcoded `"… Rack"` (carried
-  over from the original) in `eth_task`, so a `mini` build announces itself as
-  "Rack" on the network. Parameterize by `VARIANT_NAME` when this matters.
+- **Node name:** `node_short_name`/`node_long_name` seed from `VARIANT_NAME`
+  (so a `mini` build no longer announces "Rack" — B12 fixed), are loaded from NVS
+  (`SHORTNAME`/`LONGNAME`), reported in ArtPollReply + `/api/state`, and settable
+  over Art-Net via ArtAddress (R22).
 - **`xthal_get_ccount()`** in `dmx_task` is the original's cycle counter; it still
   resolves on IDF v5 via the Xtensa FreeRTOS port. If a build ever can't find it,
   swap to `esp_cpu_get_cycle_count()` (`esp_cpu.h`) — same value.

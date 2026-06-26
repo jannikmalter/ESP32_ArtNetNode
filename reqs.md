@@ -61,9 +61,9 @@ One row each. Use "shall". `Type`: F=function, Q=quality, C=constraint.
 | R14 | F | The node shall obtain an IPv4 address via DHCP | M | G1 | ☑ | `ESP_NETIF_DEFAULT_ETH` DHCP client |
 | R15 | F | The node shall fall back to a link-local address when no DHCP is available | S | G1 | ☐ | not implemented; see T1 |
 | R16 | F | The node shall provide a 7-universe virtual patch, any universe routable to any output | M | G1 | ☑ | `DMX_patch` / `DMX_repatch`, fan-out supported |
-| R18 | F | The node shall respond to ArtPoll with ArtPollReply | S | G1 | ☑ | opcodes 0x2000/0x6000/0x7000 -> 0x2100 |
+| R18 | F | The node shall respond to ArtPoll with ArtPollReply | S | G1 | ☑ | ArtPoll 0x2000 -> ArtPollReply 0x2100; since R22 the reply is fully populated (one bound port per output). The 0x6000/0x7000-as-poll quirk was removed (R22) — they now have their correct ArtAddress/ArtInput meaning |
 | R21 | Q | The Art-Net ingest path shall be bounds-checked and signed-safe | M | G3 | ☑ | see B1, B2 |
-| R22 | F | The node shall support native Art-Net output configuration and query (set per-output universe patch and node name via ArtAddress; report config in ArtPollReply) | S | G1 | ☐ | replaces the 0x6000/0x7000 ArtPoll-trigger quirk; touches B12; see [reqs/R22.md](reqs/R22.md), T7 |
+| R22 | F | The node shall support native Art-Net output configuration and query (set per-output universe patch and node name via ArtAddress; report config in ArtPollReply) | S | G1 | ☑ | **Done 2026-06-26.** ArtPollReply reports all 7 outputs as bound ports (Art-Net 4 per-port binding, BindIndex 1..7, one universe per reply); ArtAddress (0x6000) sets per-output universe + node name, persisted via the stop/start+NVS handshake; the old 0x6000/0x7000 ArtPoll-trigger quirk removed (closes B12). ArtInput (0x7000) out of scope (output-only node). See [reqs/R22.md](reqs/R22.md), T7 |
 
 ### Configuration interfaces
 
@@ -108,7 +108,6 @@ the deployed Olimex setup) is noted in the detail files.
 | ID | Bug | Ref | Sev | Done |
 |----|-----|-----|-----|------|
 | B11 | `num_chan` not clamped on NVS load | R12 | Lo | ☐ |
-| B12 | Hardcoded "Rack" node name regardless of variant (cosmetic) | R20 | Lo | ☐ |
 
 Detail: [reqs/B11.md](reqs/B11.md), [reqs/B12.md](reqs/B12.md).
 
@@ -127,6 +126,7 @@ Detail: [reqs/B11.md](reqs/B11.md), [reqs/B12.md](reqs/B12.md).
 | B7 | Art-Net ingest | recvfrom/socket errors unhandled: unsigned length made a `-1` return look like `0xFFFFFFFF` and process a stale buffer; socket fd unchecked | R21 | Md | ☑ | Signed `recv_len` / `s`; check `socket()` (restart on failure); added `SO_RCVTIMEO` so an idle `recvfrom` returns `-1` and is skipped by the `>= 10` guard (landed with R28's packets/sec window) |
 | B13 | Timing | `vTaskDelay` tick-vs-ms mismatch in `eth_task` reconfig poll | R13 | Lo | ☑ | Use `vTaskDelay(1)` |
 | B14 | Concurrency | `stopDMX` used a fixed-delay timing assumption; shared flags not `volatile` | R5 | Lo | ☑ | Added `dmxStopped` ack handshake; `stopFlag` / `dmxStopped` / `trigger` marked `volatile` |
+| B12 | Naming | Hardcoded "Rack" node name regardless of variant (cosmetic) | R20 | Lo | ☑ | Fixed with R22 (2026-06-26): `node_short_name`/`node_long_name` seeded from `VARIANT_NAME`, loaded from NVS, and settable over Art-Net (ArtAddress). T4 subsumed |
 
 ### By design
 

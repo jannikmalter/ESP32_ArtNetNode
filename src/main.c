@@ -12,11 +12,12 @@
  * platformio.ini — see the BUILD CONFIGURATION block below.
  */
 
-#define FIRMWARE_VERSION "1.2"
+#define FIRMWARE_VERSION "1.9"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>            /* isxdigit() for the query-string URL decoder */
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -27,6 +28,7 @@
 #include "esp_log.h"
 #include "esp_system.h"
 #include "esp_timer.h"        /* esp_timer_get_time() for the Art-Net pps window */
+#include "esp_mac.h"          /* esp_read_mac() for the ArtPollReply MAC field (R22) */
 #include "sdkconfig.h"
 
 #include "driver/gpio.h"
@@ -128,6 +130,13 @@
 #define BREAK 30
 #define MAB 10
 
+/* Art-Net opcodes (little-endian on the wire; see info.md constants section). */
+#define OP_POLL      0x2000   /* ArtPoll      -> we reply with ArtPollReply       */
+#define OP_POLLREPLY 0x2100   /* ArtPollReply -> our reply opcode                 */
+#define OP_DMX       0x5000   /* ArtDmx       -> DMX data for one universe        */
+#define OP_ADDRESS   0x6000   /* ArtAddress   -> remote config (patch/name) (R22) */
+#define OP_INPUT     0x7000   /* ArtInput     -> input enable/disable (unhandled) */
+
 static const char *TAG = "ArtNetNode";
 
 uint8_t *DMXbuf;
@@ -156,6 +165,13 @@ uint_fast8_t synchronize = 0;
 uint_fast16_t sync_addr = 0;
 uint_fast16_t num_chan = 0;
 volatile uint_fast8_t trigger = 0;
+
+/* Node identity reported in ArtPollReply and settable over Art-Net via ArtAddress
+ * (R22). Seeded from the build VARIANT_NAME so a "mini" build no longer announces
+ * "Rack" (B12); overridden by NVS (keys SHORTNAME/LONGNAME) and by ArtAddress.
+ * ShortName max 17 chars + null, LongName max 63 + null (Art-Net field sizes). */
+char node_short_name[18] = "LF " VARIANT_NAME;
+char node_long_name[64]  = "LICHTFETISCH ArtNet " VARIANT_NAME;
 
 float refresh_rate;
 
@@ -431,6 +447,46 @@ void load_sync_state()
 	num_chan = (uint_fast16_t)num_chan_load;
 }
 
+/* Node name (R22). Like load_sync_state, nvs_get_str only writes on success, so a
+ * fresh device keeps the VARIANT_NAME-seeded defaults. The size args are in/out;
+ * pass the full buffer sizes. */
+void load_node_name()
+{
+	nvs_handle my_handle;
+	if (nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle) != ESP_OK)
+	{
+		ESP_LOGE(TAG, "load_node_name: nvs_open failed, keeping defaults");
+		return;
+	}
+	size_t short_size = sizeof(node_short_name);
+	size_t long_size  = sizeof(node_long_name);
+	nvs_get_str(my_handle, "SHORTNAME", node_short_name, &short_size);
+	nvs_get_str(my_handle, "LONGNAME", node_long_name, &long_size);
+	nvs_close(my_handle);
+}
+
+/* Persist the node name. Reuses the stopDMX()->NVS->startDMX() handshake so the
+ * flash write never races the core-1 critical section (same contract as the patch
+ * and sync save paths). */
+void save_node_name()
+{
+	stopDMX();
+
+	nvs_handle my_handle;
+	if (nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle) != ESP_OK)
+	{
+		ESP_LOGE(TAG, "save_node_name: nvs_open failed");
+		startDMX();   /* never leave DMX parked on a failed save */
+		return;
+	}
+	nvs_set_str(my_handle, "SHORTNAME", node_short_name);
+	nvs_set_str(my_handle, "LONGNAME", node_long_name);
+	nvs_commit(my_handle);
+	nvs_close(my_handle);
+
+	startDMX();
+}
+
 void update_dmx_ptr()
 {
 	memset(DMXbuf, 0, NUM_OUT*512);
@@ -446,6 +502,147 @@ void update_dmx_ptr()
 			}
 		}
 	}
+}
+
+/* ===========================================================================
+ *  NATIVE ART-NET CONFIG & QUERY  (R22)
+ *
+ *  ArtPollReply reports each output as its own bound port (Art-Net 4 per-port
+ *  binding: one universe per reply, NumPortsLo=1, BindIndex 1..NUM_OUT) so every
+ *  output advertises a fully independent 15-bit Port-Address. ArtAddress lets a
+ *  controller set an output's universe and the node name remotely, persisted via
+ *  the same stopDMX()->NVS->startDMX() handshake the web UI uses.
+ *
+ *  15-bit Port-Address = NetSwitch(7) : SubSwitch(4) : Sw(4). DMX_patch[i] holds
+ *  the full value; the three nibble groups map onto the ArtPollReply/ArtAddress
+ *  NetSwitch / SubSwitch / SwOut fields.
+ * =========================================================================== */
+
+#define ARTNET_REPLY_LEN 239   /* >= 207 minimum; covers through GoodOutputB */
+
+/* Send one unicast ArtPollReply per output (BindIndex 1..NUM_OUT). dst is the
+ * poller; replyBuf is the caller's BUFLEN scratch buffer. */
+static void send_artpollreply(int s, char *replyBuf, struct sockaddr_in *dst, uint32_t slen)
+{
+	static uint8_t mac[6];
+	static uint_fast8_t mac_read = 0;
+	if (!mac_read)
+	{
+		if (esp_read_mac(mac, ESP_MAC_ETH) != ESP_OK)
+			memset(mac, 0, sizeof(mac));   /* zero is legal per spec */
+		mac_read = 1;
+	}
+
+	const char *dot = strchr(FIRMWARE_VERSION, '.');
+
+	for (uint_fast8_t k = 0; k < NUM_OUT; k++)
+	{
+		uint_fast16_t addr = DMX_patch[k];
+
+		memset(replyBuf, 0, ARTNET_REPLY_LEN);
+		memcpy(replyBuf, "Art-Net", 8);
+		replyBuf[8] = (uint8_t)(OP_POLLREPLY & 0xFF);   /* low byte first */
+		replyBuf[9] = (uint8_t)(OP_POLLREPLY >> 8);
+
+		memcpy(replyBuf + 10, (const void *)&device_ip, 4);   /* IP (NBO) */
+		replyBuf[14] = 0x36;   /* Port 0x1936, low byte first */
+		replyBuf[15] = 0x19;
+
+		replyBuf[16] = (uint8_t)atoi(FIRMWARE_VERSION);       /* VersInfoH */
+		replyBuf[17] = (uint8_t)(dot ? atoi(dot + 1) : 0);    /* VersInfoL */
+
+		replyBuf[18] = (uint8_t)((addr >> 8) & 0x7F);   /* NetSwitch  (bits 14-8) */
+		replyBuf[19] = (uint8_t)((addr >> 4) & 0x0F);   /* SubSwitch  (bits 7-4)  */
+
+		replyBuf[23] = 0xE0;   /* Status1: indicators normal + network prog authority */
+
+		strncpy(replyBuf + 26, node_short_name, 17);    /* ShortName[18] */
+		strncpy(replyBuf + 44, node_long_name, 63);     /* LongName[64]  */
+
+		replyBuf[173] = 1;      /* NumPortsLo (NumPortsHi=0): one port per reply */
+		replyBuf[174] = 0x80;   /* PortTypes[0]: output, DMX512 */
+		replyBuf[182] = 0x80;   /* GoodOutputA[0]: data being output */
+		replyBuf[190] = (uint8_t)(addr & 0x0F);   /* SwOut[0] (bits 3-0) */
+
+		replyBuf[200] = 0x00;   /* Style: StNode */
+		memcpy(replyBuf + 201, mac, 6);                 /* MAC[6] */
+		memcpy(replyBuf + 207, (const void *)&device_ip, 4);   /* BindIp */
+		replyBuf[211] = (uint8_t)(k + 1);   /* BindIndex 1..NUM_OUT */
+		replyBuf[212] = 0x0D;   /* Status2: web-config + 15-bit Port-Address + DHCP-capable */
+
+		sendto(s, replyBuf, ARTNET_REPLY_LEN, 0, (struct sockaddr *)dst, slen);
+	}
+}
+
+/* Apply an ArtAddress packet (OpCode 0x6000): set one output's universe and/or the
+ * node name, persist, then reply with ArtPollReply. buf/recv_len are the received
+ * datagram; the reply uses the caller's replyBuf and dst. */
+static void handle_artaddress(const char *buf, int recv_len, int s, char *replyBuf,
+                              struct sockaddr_in *dst, uint32_t slen)
+{
+	if (recv_len < 107)   /* full ArtAddress is 107 bytes (Command at offset 106) */
+		return;
+
+	/* BindIndex (offset 13) selects the output; 0 or 1 == root == output 0. */
+	uint_fast8_t bind = (uint8_t)buf[13];
+	uint_fast8_t idx = (bind <= 1) ? 0 : (uint_fast8_t)(bind - 1);
+	if (idx >= NUM_OUT)
+		return;
+
+	/* Rebuild the targeted output's Port-Address from the current value, replacing
+	 * only the sub-fields whose source byte has bit7 set (spec: "ignored unless bit
+	 * 7 is high"). NetSwitch=offset 12, SubSwitch=offset 104, SwOut[0]=offset 100. */
+	uint_fast8_t netsw = (uint8_t)buf[12];
+	uint_fast8_t subsw = (uint8_t)buf[104];
+	uint_fast8_t swout = (uint8_t)buf[100];
+	uint_fast16_t addr = DMX_patch[idx];
+	if (netsw & 0x80) addr = (uint_fast16_t)((addr & 0x00FF) | ((netsw & 0x7F) << 8));
+	if (subsw & 0x80) addr = (uint_fast16_t)((addr & 0xFF0F) | ((subsw & 0x0F) << 4));
+	if (swout & 0x80) addr = (uint_fast16_t)((addr & 0xFFF0) | (swout & 0x0F));
+
+	uint_fast8_t patch_changed = (addr != DMX_patch[idx]);
+	if (patch_changed)
+		DMX_patch[idx] = addr;
+
+	/* PortName (offset 14, 18 bytes) and LongName (offset 32, 64 bytes): the node
+	 * ignores a field whose first byte is null. */
+	uint_fast8_t name_changed = 0;
+	if (buf[14] != '\0')
+	{
+		strncpy(node_short_name, buf + 14, 17);
+		node_short_name[17] = '\0';
+		name_changed = 1;
+	}
+	if (buf[32] != '\0')
+	{
+		strncpy(node_long_name, buf + 32, 63);
+		node_long_name[63] = '\0';
+		name_changed = 1;
+	}
+
+	/* Persist through the proven handshake. PATCH order: save (stops/starts DMX),
+	 * then rebuild the dedup repatch table (matches /api/config). */
+	if (patch_changed)
+	{
+		/* Sync mode and channel count cannot be set over Art-Net. Reset them to
+		 * defaults (free-run, full 512-channel frame) on any Art-Net patch change,
+		 * so a node configured solely via Art-Net behaves predictably instead of
+		 * silently keeping stale web-UI values the user can't see here. */
+		synchronize = 0;
+		sync_addr = 0;
+		num_chan = 512;
+		save_sync_state();
+
+		save_dmx_patch();
+		update_dmx_ptr();
+	}
+	if (name_changed)
+		save_node_name();
+
+	/* Command byte (offset 106): AcNone / AcLed* / AcCancelMerge etc. are not
+	 * implemented on this output-only node; ignore safely (no error). */
+
+	send_artpollreply(s, replyBuf, dst, slen);   /* spec: node replies with ArtPollReply */
 }
 
 void eth_task()
@@ -522,7 +719,7 @@ void eth_task()
 				pps_count++;   /* count every Art-Net packet (R28) */
 
 				opcode = ((uint8_t)ArtNetBuf[9] << 8) | (uint8_t)ArtNetBuf[8];
-				if (opcode == 0x5000 && recv_len >= 18)
+				if (opcode == OP_DMX && recv_len >= 18)
 				{
 					portaddress = ((uint8_t)ArtNetBuf[15] << 8) | (uint8_t)ArtNetBuf[14];
 					bufaddress = -1;
@@ -550,25 +747,19 @@ void eth_task()
 							trigger = 1;
 					}
 				}
-				else if (opcode == 0x2000 || opcode == 0x6000 || opcode == 0x7000)
+				else if (opcode == OP_POLL)
 				{
-					memset(replyBuf, 0, BUFLEN);
-					memcpy(replyBuf, artnet_header, 8);
-					replyBuf[8] = 0x00;
-					replyBuf[9] = 0x21;
-
-					uint32_t reply_ip = device_ip;   /* real device IP (NBO), 0.0.0.0 until link up */
-					memcpy(replyBuf + 10, &reply_ip, 4);
-
-					replyBuf[14] = 0x36;
-					replyBuf[15] = 0x19;
-
-					replyBuf[23] = 1 << 7 | 1 << 6 | 1 << 5;
-					strcpy(replyBuf + 26, "LF Rack");
-					strcpy(replyBuf + 44, "LICHTFETISCH ArtNet Rack");
-
-					sendto(s, replyBuf, 239, 0, (struct sockaddr *)&si_other, slen);
+					/* Discovery: report every output as its own bound port (R22). */
+					send_artpollreply(s, replyBuf, &si_other, slen);
 				}
+				else if (opcode == OP_ADDRESS)
+				{
+					/* Remote config: set output universe / node name (R22). */
+					handle_artaddress(ArtNetBuf, recv_len, s, replyBuf, &si_other, slen);
+				}
+				/* OP_INPUT (0x7000) intentionally unhandled: output-only node.
+				 * The old firmware mis-used 0x6000/0x7000 as poll triggers; that
+				 * quirk is gone now that they have their correct meaning. */
 			}
 		}
 	}
@@ -644,11 +835,43 @@ void stats_task(void *arg)
  *  handler registers on this same server instance.
  * =========================================================================== */
 
+/* Escape a string into dst as a JSON string body (no surrounding quotes): the
+ * node names can be set to arbitrary bytes over Art-Net, so a stray " \ or
+ * control char must never break the /api/state JSON. Always NUL-terminates and
+ * never writes past dstlen (a name too long to fit is truncated, not overrun). */
+static void json_escape(const char *src, char *dst, int dstlen)
+{
+	int j = 0;
+	for (; *src && j < dstlen - 7; src++)   /* worst case adds \uXXXX (6) + NUL */
+	{
+		unsigned char c = (unsigned char)*src;
+		switch (c)
+		{
+		case '"':  dst[j++] = '\\'; dst[j++] = '"';  break;
+		case '\\': dst[j++] = '\\'; dst[j++] = '\\'; break;
+		case '\b': dst[j++] = '\\'; dst[j++] = 'b';  break;
+		case '\f': dst[j++] = '\\'; dst[j++] = 'f';  break;
+		case '\n': dst[j++] = '\\'; dst[j++] = 'n';  break;
+		case '\r': dst[j++] = '\\'; dst[j++] = 'r';  break;
+		case '\t': dst[j++] = '\\'; dst[j++] = 't';  break;
+		default:
+			if (c < 0x20)
+				j += sprintf(dst + j, "\\u%04x", c);
+			else
+				dst[j++] = (char)c;
+		}
+	}
+	dst[j] = '\0';
+}
+
 /* Flat JSON snapshot of all settings + live refresh rate (read by index.html). */
 static int build_state_json(char *buf, int len)
 {
-	int n = snprintf(buf, len, "{\"fw\":\"%s\",\"board\":\"%s\",\"variant\":\"%s\",\"patch\":[",
-	                 FIRMWARE_VERSION, BOARD_NAME, VARIANT_NAME);
+	char sname[128], lname[400];   /* escaped: up to 6x the 17/63-byte names */
+	json_escape(node_short_name, sname, sizeof(sname));
+	json_escape(node_long_name, lname, sizeof(lname));
+	int n = snprintf(buf, len, "{\"fw\":\"%s\",\"board\":\"%s\",\"variant\":\"%s\",\"name\":\"%s\",\"lname\":\"%s\",\"patch\":[",
+	                 FIRMWARE_VERSION, BOARD_NAME, VARIANT_NAME, sname, lname);
 	for (uint_fast8_t i = 0; i < NUM_OUT; i++)
 		n += snprintf(buf + n, len - n, "%s%u", i ? "," : "", (unsigned)DMX_patch[i]);
 	n += snprintf(buf + n, len - n,
@@ -666,20 +889,40 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t state_get_handler(httpd_req_t *req)
 {
-	char buf[256];
+	char buf[640];
 	int n = build_state_json(buf, sizeof(buf));
 	httpd_resp_set_type(req, "application/json");
 	return httpd_resp_send(req, buf, n);
 }
 
-/* POST /api/config?patch=a,b,c,d,e,f,g&sync=0|1&sync_addr=n&num_chan=n
+/* In-place percent-decode of a query-string value ('+' -> space, %XX -> byte).
+ * httpd_query_key_value does not decode, so names with spaces/punctuation arrive
+ * encoded; the web UI encodeURIComponent()s them and we undo it here. */
+static void url_decode(char *s)
+{
+	char *d = s;
+	for (; *s; s++)
+	{
+		if (*s == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2]))
+		{
+			char h[3] = { s[1], s[2], '\0' };
+			*d++ = (char)strtol(h, NULL, 16);
+			s += 2;
+		}
+		else
+			*d++ = (*s == '+') ? ' ' : *s;
+	}
+	*d = '\0';
+}
+
+/* POST /api/config?patch=a,b,c,d,e,f,g&sync=0|1&sync_addr=n&num_chan=n&sname=..&lname=..
  * Any subset of keys may be present; applies each via the shared save path, then
  * returns the fresh state JSON. */
 static esp_err_t config_post_handler(httpd_req_t *req)
 {
-	char query[160];
-	char val[64];
-	uint_fast8_t save_patch = 0, save_sync = 0;
+	char query[512];
+	char val[200];
+	uint_fast8_t save_patch = 0, save_sync = 0, save_name = 0;
 
 	if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
 	{
@@ -710,6 +953,21 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 			num_chan = n;
 			save_sync = 1;
 		}
+		/* Node identity (same length caps as the ArtAddress path: 17 / 63). */
+		if (httpd_query_key_value(query, "sname", val, sizeof(val)) == ESP_OK)
+		{
+			url_decode(val);
+			strncpy(node_short_name, val, 17);
+			node_short_name[17] = '\0';
+			save_name = 1;
+		}
+		if (httpd_query_key_value(query, "lname", val, sizeof(val)) == ESP_OK)
+		{
+			url_decode(val);
+			strncpy(node_long_name, val, 63);
+			node_long_name[63] = '\0';
+			save_name = 1;
+		}
 	}
 
 	/* Reuse the proven stop/start + NVS handshake. PATCH order matters:
@@ -721,8 +979,10 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 	}
 	if (save_sync)
 		save_sync_state();
+	if (save_name)
+		save_node_name();
 
-	char buf[256];
+	char buf[640];
 	int n = build_state_json(buf, sizeof(buf));
 	httpd_resp_set_type(req, "application/json");
 	return httpd_resp_send(req, buf, n);
@@ -902,6 +1162,7 @@ void app_main(void)
 	load_dmx_patch();
 	update_dmx_ptr();
 	load_sync_state();
+	load_node_name();
 
 	/* --- Tasks: network on core 0, DMX bit-bang alone on core 1 --- */
 	if (xTaskCreatePinnedToCore(eth_task, "eth_task", 2048, NULL, (tskIDLE_PRIORITY + 2), NULL, 0) != pdPASS ||

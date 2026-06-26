@@ -10,16 +10,20 @@ priority in parentheses.
   (restart on failure), `SO_RCVTIMEO` so idle `recvfrom` returns are skipped;
   landed with R28. (B7, Medium)
 - [ ] **T3** — Clamp `num_chan` to 1..512 on NVS load. (B11, Low)
-- [ ] **T4** — Derive node name from `VARIANT_NAME` (banner + ArtPollReply).
-  (B12, Low)
+- [x] **T4** — Derive node name from `VARIANT_NAME`. **Done (2026-06-26):**
+  subsumed by T7 — `node_short_name`/`node_long_name` seed from `VARIANT_NAME`,
+  load from NVS, and feed the ArtPollReply. (B12, Low)
 - [ ] **T5** — Define and verify WT32-ETH01 DMX pin maps on hardware (currently
   placeholders). (R19, R20, Medium when WT32 built)
 - [ ] **T6** — Optional: move `update_dmx_ptr()` inside the stop/start window for
   glitch-free re-patch. (B5, Optional)
-- [ ] **T7** — Implement native Art-Net config/query: ArtAddress (set + persist
-  universe patch and node name), full ArtPollReply (per-port universes, name,
-  status), optional ArtInput (0x7000); read [docs/art-net.pdf](docs/art-net.pdf).
-  (R22, Medium)
+- [x] **T7** — Implement native Art-Net config/query. **Done (2026-06-26):**
+  ArtPollReply reports all 7 outputs as bound ports (Art-Net 4 per-port binding,
+  one universe per reply, BindIndex 1..7); ArtAddress (0x6000) sets + persists the
+  per-output universe and node name via the stop/start + NVS handshake; the old
+  0x6000/0x7000 ArtPoll-trigger quirk removed. ArtInput (0x7000) left unhandled
+  (output-only node). `send_artpollreply`/`handle_artaddress` in
+  [src/main.c](src/main.c). (R22, Medium)
 - [x] **T8** — Web UI. **Done (2026-06-25):** `esp_http_server` on core 0 (port 80)
   serving one self-contained page ([src/index.html](src/index.html), embedded via
   [gen_web_assets.py](gen_web_assets.py)) with `/api/state` + `/api/config`,

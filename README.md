@@ -10,8 +10,9 @@ Interfaces ESP-IDF directly, no external libraries.
 
 - **Art-Net in:** UDP, port `6454`, wired Ethernet (RMII + LAN87xx PHY)
 - **DMX out:** 7 × DMX512, software bit-bang at 250 kbaud
-- **Config:** web UI on port `80` (config, live graphs, OTA upload)
-- **Discovery:** responds to ArtPoll with ArtPollReply
+- **Config:** web UI on port `80` (config, live graphs, OTA upload), plus native
+  Art-Net config via ArtAddress (per-output universe + node name)
+- **Discovery:** answers ArtPoll, reporting each output as its own bound port
 - **Persistence:** configuration stored in NVS
 - **Targets:** Olimex ESP32-POE (deployed) and WT32-ETH01 (secondary), `rack`/`mini` variants
 
@@ -138,8 +139,8 @@ are driven in parallel.
 
 - `GPIO_patch[7]`: physical GPIO for each output, in device order. Chosen at
   compile time per board + variant.
-- `DMX_patch[7]`: Art-Net universe feeding each output. Set via the web UI,
-  persisted to NVS.
+- `DMX_patch[7]`: Art-Net universe feeding each output. Set via the web UI or over
+  Art-Net (ArtAddress), persisted to NVS.
 - `DMX_repatch[7]`: built by `update_dmx_ptr()`. If several outputs are patched to
   the same universe, they share one 512-byte buffer slot, so one universe can fan
   out to multiple physical outputs.
@@ -164,7 +165,8 @@ hand.
 | Web UI port | `80` |
 | Socket buffer | `1024` bytes |
 | ArtDMX opcode | `0x5000` |
-| ArtPoll opcodes handled | `0x2000`, `0x6000`, `0x7000` → reply `0x2100` |
+| ArtPoll opcode | `0x2000` → ArtPollReply `0x2100` (one per output, BindIndex 1..7) |
+| ArtAddress opcode | `0x6000` → set per-output universe + node name |
 | ArtDMX universe (port-address) | bytes 14–15 |
 | ArtDMX data length | bytes 16–17 |
 | ArtDMX data | from byte 18 |
@@ -222,6 +224,8 @@ Configuration is stored in the NVS namespace `"storage"`:
 | `SYNC_STATE` | u8 | sync on/off |
 | `SYNC_ADDR` | u16 | universe to sync to |
 | `NUM_CHAN` | u16 | channels per output |
+| `SHORTNAME` | str | Art-Net node short name |
+| `LONGNAME` | str | Art-Net node long name |
 
 On a fresh device (keys absent) defaults are used: zeroed patch, sync off,
 `NUM_CHAN = 512`. If NVS init fails because of a version/format change, it is
@@ -331,8 +335,6 @@ the web UI / OTA were added on top. See [info.md](info.md) for port details.
 
 ## Known limitations
 
-- Hardcoded node name. The ArtPollReply announces `LICHTFETISCH ArtNet Rack` /
-  `LF Rack` regardless of build, so a `mini` build reports "Rack" on the network.
 - No Wi-Fi/BT on Olimex. The Olimex clock uses the internal APLL (`EMAC_CLK_OUT`);
   per ESP32 errata this precludes simultaneous Wi-Fi/BT.
 - WT32-ETH01 is untested. Pin maps are placeholders; no WT32 device has been built.
