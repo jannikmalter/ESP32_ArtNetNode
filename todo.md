@@ -57,3 +57,14 @@ priority in parentheses.
   `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS` enabled; `stats_task` (core 0) derives
   load from core-0 IDLE run-time over a 1 s window, published as `load0` in
   `/api/state`; third sparkline in [src/index.html](src/index.html). (R29, Should)
+- [x] **T15** — Web UI node-name editing + polish. **Done (2026-06-26):** pencil
+  dialog edits short/long name (tab = short, header = long), `/api/config` gains
+  `sname`/`lname` (URL-decoded, `save_node_name()` path); plus the UI refinements —
+  connection-health LED, single-row outputs with per-field dirty highlighting and a
+  Reset button, mobile layout (4-wide grid, stacked settings, numeric keypads,
+  native steppers), smaller/narrower buttons, footer identity line. (R30, R27,
+  Should)
+- [x] **T16** — Harden web-config input handling. **Done (2026-06-26):** JSON-escape
+  node names in `/api/state` (`json_escape`), size response buffers for worst-case
+  escaping, reject over-long queries/values, cap/clamp every field — so no
+  web-entered value can break the node. (R31, Must)

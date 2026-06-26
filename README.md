@@ -192,15 +192,18 @@ removed.)
 | Route | Method | Effect |
 |---|---|---|
 | `/` | GET | The config + monitoring page |
-| `/api/state` | GET | Flat JSON: firmware/board/variant, `patch[7]`, `sync`, `sync_addr`, `num_chan`, live `refresh`, `pps` (Art-Net packets/sec), `load0` (core-0 load) |
-| `/api/config` | POST | Query params `patch=a,…,g` · `sync=0\|1` · `sync_addr=n` · `num_chan=n` (any subset); applies + returns fresh state |
+| `/api/state` | GET | Flat JSON: firmware/board/variant, `name` (short) + `lname` (long), `patch[7]`, `sync`, `sync_addr`, `num_chan`, live `refresh`, `pps` (Art-Net packets/sec), `load0` (core-0 load) |
+| `/api/config` | POST | Query params `patch=a,…,g` · `sync=0\|1` · `sync_addr=n` · `num_chan=n` · `sname=…` · `lname=…` (any subset); applies + returns fresh state |
 | `/api/ota` | POST | Streams a raw firmware image into the inactive OTA slot, then reboots into it (see below) |
 
 Settings changes (`/api/config`) run the `stopDMX()` → write NVS → `startDMX()`
 handshake, so shared state is never mutated while the generator is live. The page
-polls `/api/state` about once a second and draws 1-minute sparkline history for
-packet rate, refresh rate, and core-0 load entirely client-side (nothing is logged
-on the device).
+shows the long name as its header and the short name as the browser-tab title, with
+a small dialog to edit both, and a connection LED that tracks whether the node is
+answering. The page polls `/api/state` about once a second and draws 1-minute
+sparkline history for packet rate, refresh rate, and core-0 load entirely
+client-side (nothing is logged on the device). All web inputs are bounds-checked and
+the JSON output is escaped, so no value entered through the page can break the node.
 
 ### Firmware update (OTA)
 

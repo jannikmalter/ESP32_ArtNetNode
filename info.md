@@ -365,14 +365,39 @@ OTA upload endpoint (**R26**). The raw TCP CLI it replaced was **removed**
 | Route | Method | Effect |
 |---|---|---|
 | `/` | GET | serves the embedded config page (`index_html`) |
-| `/api/state` | GET | flat JSON: fw/board/variant, `name`, `patch[7]`, `sync`, `sync_addr`, `num_chan`, live `refresh`, live `pps`, live `load0` |
-| `/api/config` | POST | query params `patch=a,b,…,g` · `sync=0\|1` · `sync_addr=n` · `num_chan=n` (any subset); applies + returns fresh state |
+| `/api/state` | GET | flat JSON: fw/board/variant, `name` (short), `lname` (long), `patch[7]`, `sync`, `sync_addr`, `num_chan`, live `refresh`, live `pps`, live `load0` |
+| `/api/config` | POST | query params `patch=a,b,…,g` · `sync=0\|1` · `sync_addr=n` · `num_chan=n` · `sname=…` · `lname=…` (any subset); applies + returns fresh state |
 | `/api/ota` | POST | raw firmware image (octet-stream body) → inactive OTA slot → reboot; see [Firmware update (OTA)](#firmware-update-ota) |
 
-`/api/config` accepts the same settings the old TCP CLI did — `patch` (per-output
-universe), `sync`, `sync_addr`, `num_chan` — and applies them through the
-`save_dmx_patch()` / `save_sync_state()` path, inheriting the `stopDMX()` → NVS →
-`startDMX()` handshake so it never mutates live DMX state.
+`/api/config` accepts the same DMX settings the old TCP CLI did — `patch` (per-output
+universe), `sync`, `sync_addr`, `num_chan` — plus the node names `sname`/`lname`
+(**R30**), and applies them through the `save_dmx_patch()` / `save_sync_state()` /
+`save_node_name()` paths, inheriting the `stopDMX()` → NVS → `startDMX()` handshake
+so it never mutates live DMX state. The names arrive percent-encoded and are
+`url_decode()`d in place (httpd does not decode query values), then `strncpy`-capped
+to the same 17/63 lengths as the ArtAddress path.
+
+**Web-input hardening (R31).** No value entered through the web UI can break the
+node. `/api/state` runs both names through `json_escape()` (escapes `"`, `\`, and
+control bytes as `\uXXXX`) so a name set to arbitrary bytes — over Art-Net or the
+web form — can never produce malformed JSON; the response buffers are sized for
+worst-case 6×-expanded names. Over-long query strings or values are rejected
+outright (the httpd helpers return `TRUNC`, not `OK`, and every parse acts only on
+`OK`), names are length-capped, `num_chan` is clamped 1..512, and `patch`/`sync_addr`
+are stored as labels that are compared — never used as buffer indices. This is the
+web/HTTP counterpart of R21's Art-Net bounds-checking.
+
+### Names, live state & UI behavior (R27 / R30)
+
+The page header shows the **long name** and the browser tab title shows the **short
+name**, both refreshed every poll; a pencil icon opens a small dialog to edit them.
+The output row is a single editable line per output that the poll keeps live, except
+that any field the user changes is flagged with a red border (`.edit`) and frozen
+from further poll overwrites until **Save** (commit) or **Reset** (discard, reseed
+from the device) — the same dirty model applies to Mode/Sync/Channels. A
+connection-health **LED** by the title is green while `/api/state` replies and red
+once a poll fails (the poll uses a 600 ms abort so a dead node shows red within ~1 s
+on the LAN, not after the browser's default timeout).
 
 ### Live monitoring graphs (R28 / T13)
 
@@ -482,8 +507,9 @@ fully independent universe — every output can have any universe.
   intentional — keep it consistent.
 - **Node name:** `node_short_name`/`node_long_name` seed from `VARIANT_NAME`
   (so a `mini` build no longer announces "Rack" — B12 fixed), are loaded from NVS
-  (`SHORTNAME`/`LONGNAME`), reported in ArtPollReply + `/api/state`, and settable
-  over Art-Net via ArtAddress (R22).
+  (`SHORTNAME`/`LONGNAME`), reported in ArtPollReply + `/api/state` (JSON-escaped,
+  R31), and settable both over Art-Net via ArtAddress (R22) and through the web UI
+  `/api/config` `sname`/`lname` params (R30) — both routes share `save_node_name()`.
 - **`xthal_get_ccount()`** in `dmx_task` is the original's cycle counter; it still
   resolves on IDF v5 via the Xtensa FreeRTOS port. If a build ever can't find it,
   swap to `esp_cpu_get_cycle_count()` (`esp_cpu.h`) — same value.

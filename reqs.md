@@ -72,9 +72,11 @@ One row each. Use "shall". `Type`: F=function, Q=quality, C=constraint.
 | R4 | F | ~~The node shall support runtime configuration over a raw TCP interface (port 1337)~~ | M | G1 | ☑ | **Removed 2026-06-26** — superseded by R23 (web UI). `tcp_task` deleted; port 1337 no longer served |
 | R17 | F | ~~Patch and settings shall be configurable over the raw TCP interface~~ | M | G1 | ☑ | **Removed 2026-06-26** — superseded by R23. Same settings now configured via the web UI `/api/config` |
 | R23 | F | The node shall replace the TCP CLI with an interactive web UI exposing the same settings and live state | M | G6 | ☑ | Web UI on `esp_http_server` (port 80, core 0): `/`, `/api/state`, `/api/config`, `/api/ota`; reuses stop/start + NVS handshake. **TCP CLI removed 2026-06-26** (R4/R17 retired). See [reqs/R23.md](reqs/R23.md), T8 |
-| R27 | Q | The web UI shall be lightweight, fast-loading, and visually polished | S | G6 | ☑ | single self-contained page ~8.5 KB (config + live graphs + OTA upload), served from flash, no CDNs/libs (R7), responsive; [src/index.html](src/index.html) |
+| R27 | Q | The web UI shall be lightweight, fast-loading, and visually polished | S | G6 | ☑ | single self-contained page ~13 KB (config + live graphs + OTA upload), served from flash, no CDNs/libs (R7); responsive (mobile breakpoint, numeric keypads, native steppers); per-field dirty highlighting + Reset, connection-health LED, name-edit dialog; [src/index.html](src/index.html) |
+| R30 | F | The web UI shall let the user view and edit the node short and long name | S | G6 | ☑ | **Done 2026-06-26.** Browser tab = short name, header = long name; pencil-icon dialog edits both; `/api/config` accepts `sname`/`lname` (URL-decoded) and persists via `save_node_name()`, the same NVS path as ArtAddress (R22). See [reqs/R30.md](reqs/R30.md), T15 |
 | R28 | F | The web UI shall display rolling 1-minute history graphs of Art-Net packet rate and DMX refresh rate, built client-side from periodic state polls (no on-device logging) | S | G6 | ☑ | firmware counts Art-Net packets/sec in `eth_task`, exposes it as `pps` in `/api/state`; graphs drawn client-side in [src/index.html](src/index.html). See [reqs/R28.md](reqs/R28.md), T13 |
 | R29 | F | The node shall measure and report core-0 CPU utilization, shown in the web UI as a live value and 1-minute history graph | S | G2 | ☑ | `stats_task` computes load from core-0 IDLE run-time over a 1 s window (FreeRTOS run-time stats); exposed as `load0` in `/api/state`, graphed client-side. Core 1 is unmeasurable by design (owns its core in a critical section). Needs `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`. See [reqs/R29.md](reqs/R29.md), T14 |
+| R31 | Q | No value entered through the web UI shall be able to break the node (memory unsafety or malformed responses) | M | G3 | ☑ | **Done 2026-06-26.** `/api/state` names are JSON-escaped (`json_escape`, handles `"` `\` and control bytes); response buffers sized for worst-case escaping. Over-long query/values are rejected (httpd `TRUNC` ≠ `OK`); `sname`/`lname` `strncpy`-capped (17/63); `num_chan` clamped; `patch`/`sync_addr` are labels, never buffer indices. Web counterpart of R21. See T16 |
 
 ### Firmware update (OTA)
 
@@ -137,7 +139,7 @@ Detail: [reqs/B11.md](reqs/B11.md), [reqs/B12.md](reqs/B12.md).
 
 ## Todos
 
-The development plan lives in [todo.md](todo.md) (items T1–T12), each referencing
+The development plan lives in [todo.md](todo.md) (items T1–T16), each referencing
 the requirement/bug ID it advances.
 
 ---
