@@ -62,8 +62,8 @@ priority in parentheses.
   `sname`/`lname` (URL-decoded, `save_node_name()` path); plus the UI refinements —
   connection-health LED, single-row outputs with per-field dirty highlighting and a
   Reset button, mobile layout (4-wide grid, stacked settings, numeric keypads,
-  native steppers), smaller/narrower buttons, footer identity line. (R30, R27,
-  Should)
+  native steppers), smaller/narrower buttons, footer identity line, and an
+  OS-following light/dark theme (`prefers-color-scheme`). (R30, R27, Should)
 - [x] **T16** — Harden web-config input handling. **Done (2026-06-26):** JSON-escape
   node names in `/api/state` (`json_escape`), size response buffers for worst-case
   escaping, reject over-long queries/values, cap/clamp every field — so no

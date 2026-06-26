@@ -6,21 +6,32 @@
 <link rel="icon" href="data:,">
 <title>ArtNetNode</title>
 <style>
-:root{--bg:#11151c;--card:#1b212b;--fg:#e8edf2;--mut:#8b97a6;--line:#2a323d;--acc:#4da3ff;--ok:#3ecf8e;--bad:#e5484d}
+/* Dark palette (default). The whole UI is themed through these vars; the
+ * prefers-color-scheme:light block below is the only place that overrides them,
+ * so the page follows the OS setting with no toggle. */
+:root{--bg:#11151c;--card:#1b212b;--fg:#e8edf2;--mut:#8b97a6;--line:#2a323d;--acc:#4da3ff;--ok:#3ecf8e;--bad:#e5484d;--inset:#0d1117;--ghost-h:#222a35;--led-off:#55606e;--btn:#4da3ff;--btn-h:#62b0ff;
+  /* series colors: shared by each metric's value readout and its graph stroke,
+   * kept identical in both themes so the number always matches its sparkline. */
+  --g-pps:#4da3ff;--g-ref:#3ecf8e;--g-load:#f0a73f}
+/* Light palette: greens/reds/blue darkened a touch so they stay legible as text
+ * on white cards; the primary button stays a lighter, friendlier blue. */
+@media(prefers-color-scheme:light){
+  :root{--bg:#f4f6f9;--card:#ffffff;--fg:#1b2530;--mut:#5b6776;--line:#d3dae3;--acc:#2b7de0;--ok:#1f9d63;--bad:#d23a40;--inset:#eef1f5;--ghost-h:#e4e9f0;--led-off:#aab4c0;--btn:#5a9bea;--btn-h:#74acef}
+}
 *{box-sizing:border-box}
-/* color-scheme:dark makes native form controls (number spinners, the select
- * arrow) render dark, so the off-the-shelf steppers fit the theme. */
-body{margin:0;background:var(--bg);color:var(--fg);color-scheme:dark;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+/* color-scheme:light dark lets native form controls (number spinners, the select
+ * arrow) follow the OS theme, matching the var-driven palette above. */
+body{margin:0;background:var(--bg);color:var(--fg);color-scheme:light dark;font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
 .wrap{max-width:560px;margin:0 auto;padding:28px 16px 56px}
 h1{font-size:20px;margin:0 0 2px;letter-spacing:.2px}
 /* connection LED: grey until the first poll, green while /api/state replies,
  * red once a poll fails (decays via the 1 s interval's catch). */
-.led{display:inline-block;width:10px;height:10px;border-radius:50%;background:#55606e;vertical-align:middle;margin-left:7px;transition:background .3s,box-shadow .3s}
+.led{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--led-off);vertical-align:middle;margin-left:7px;transition:background .3s,box-shadow .3s}
 .led.ok{background:var(--ok);box-shadow:0 0 7px var(--ok)}
 .led.bad{background:var(--bad);box-shadow:0 0 7px var(--bad)}
 .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
 label{display:block;color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
-input,select{width:100%;background:#0d1117;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:9px 10px;font-size:15px;outline:none;transition:border-color .15s}
+input,select{width:100%;background:var(--inset);border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:9px 10px;font-size:15px;outline:none;transition:border-color .15s}
 input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(77,163,255,.15)}
 .grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
 .grid .o{text-align:center;color:var(--mut);font-size:11px;margin-bottom:4px}
@@ -33,12 +44,12 @@ input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(77,16
 input.edit,select.edit{border-color:var(--bad);box-shadow:0 0 0 3px rgba(229,72,77,.15)}
 .row{display:flex;gap:12px}.row>div{flex:1}
 .foot{color:var(--mut);font-size:13px;text-align:center;margin-top:28px}
-button{display:block;width:fit-content;margin:0 auto;background:var(--acc);color:#04101f;border:0;border-radius:8px;padding:9px 40px;font-size:13px;font-weight:600;cursor:pointer;transition:background .15s,color .15s}
-button:hover{background:#62b0ff}
+button{display:block;width:fit-content;margin:0 auto;background:var(--btn);color:#04101f;border:0;border-radius:8px;padding:9px 40px;font-size:13px;font-weight:600;cursor:pointer;transition:background .15s,color .15s}
+button:hover{background:var(--btn-h)}
 button:active{transform:translateY(1px)}
 .btns{display:flex;gap:12px;justify-content:center}.btns button{margin:0}
-button.ghost{background:#0d1117;color:var(--fg);border:1px solid var(--line)}
-button.ghost:hover{background:#222a35}
+button.ghost{background:var(--inset);color:var(--fg);border:1px solid var(--line)}
+button.ghost:hover{background:var(--ghost-h)}
 /* pencil button next to the header opens the name dialog */
 button.iconbtn{display:inline-block;width:auto;margin:0 0 0 8px;padding:2px 7px;font-size:14px;font-weight:400;background:transparent;color:var(--mut);vertical-align:middle}
 button.iconbtn:hover{background:transparent;color:var(--fg)}
@@ -47,12 +58,14 @@ dialog::backdrop{background:rgba(0,0,0,.55)}
 dialog label{margin-top:14px}dialog label:first-child{margin-top:0}
 .stat{display:flex;justify-content:space-between;align-items:center;color:var(--mut);font-size:13px}
 .stat b{color:var(--ok);font-size:18px;font-variant-numeric:tabular-nums}
-.graph{width:100%;height:60px;display:block;margin:8px 0 0;background:#0d1117;border:1px solid var(--line);border-radius:8px}
+/* each readout matches its sparkline color (see --g-* above) */
+#pps{color:var(--g-pps)}#refresh{color:var(--g-ref)}#load0{color:var(--g-load)}
+.graph{width:100%;height:60px;display:block;margin:8px 0 0;background:var(--inset);border:1px solid var(--line);border-radius:8px}
 .graph+.stat{margin-top:16px}
 .ax{color:var(--mut);font-size:11px;text-align:right;margin-top:6px}
 #msg{color:var(--mut);font-size:12px;text-align:center;height:16px;margin-top:10px}
 input[type=file]{padding:7px 8px;font-size:13px}
-.bar{display:none;height:8px;background:#0d1117;border:1px solid var(--line);border-radius:6px;margin:12px 0 8px;overflow:hidden}
+.bar{display:none;height:8px;background:var(--inset);border:1px solid var(--line);border-radius:6px;margin:12px 0 8px;overflow:hidden}
 .bar>span{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
 #otamsg{color:var(--mut);font-size:12px;text-align:center;height:16px;margin-top:6px}
 /* Mobile: 7 universe boxes get too narrow for 5-digit numbers, so wrap to 4 per
@@ -127,6 +140,12 @@ function led(ok){$("led").className="led "+(ok?"ok":"bad");}
 /* Client-side history (R28): up to 60 samples (~1 min at the 1 s poll). The ESP
  * stores nothing — the browser accumulates and draws these. */
 var N=60,hPps=[],hRef=[],hLoad=[],curName="",curLname="";
+/* graph stroke colors pulled from the same --g-* CSS vars the readouts use, so a
+ * sparkline can never drift from its number. */
+var cs=getComputedStyle(document.documentElement),
+    CPPS=cs.getPropertyValue("--g-pps").trim(),
+    CREF=cs.getPropertyValue("--g-ref").trim(),
+    CLOAD=cs.getPropertyValue("--g-load").trim();
 function push(a,v){a.push(v);if(a.length>N)a.shift();}
 /* Sparkline: newest sample at the right edge, 0-baselined. Scales to the window
  * max, or to fixedMax when given (used for the 0-100 % load graph). Plain canvas,
@@ -160,7 +179,7 @@ function live(s){
   $("pps").textContent=(s.pps|0)+"/s";
   $("load0").textContent=(s.load0|0)+"%";
   push(hPps,s.pps|0);push(hRef,s.refresh);push(hLoad,s.load0|0);
-  draw("g_pps",hPps,"#4da3ff");draw("g_ref",hRef,"#3ecf8e");draw("g_load",hLoad,"#f0a73f",100);
+  draw("g_pps",hPps,CPPS);draw("g_ref",hRef,CREF);draw("g_load",hLoad,CLOAD,100);
 }
 /* set(): force a control to the device value and clear its edit flag (used by
  * fill on load / after Save / on Reset). */

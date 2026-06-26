@@ -399,6 +399,11 @@ connection-health **LED** by the title is green while `/api/state` replies and r
 once a poll fails (the poll uses a 600 ms abort so a dead node shows red within ~1 s
 on the LAN, not after the browser's default timeout).
 
+The whole page is themed through CSS custom properties; a single
+`@media(prefers-color-scheme:light)` block overrides the palette, so it **follows
+the OS light/dark setting** with no in-page toggle. `color-scheme:light dark` lets
+the native form controls (number steppers, select) track the OS theme too.
+
 ### Live monitoring graphs (R28 / T13)
 
 `/api/state` also reports `pps` — **Art-Net packets per second**. `eth_task`

@@ -200,7 +200,7 @@ Settings changes (`/api/config`) run the `stopDMX()` → write NVS → `startDMX
 handshake, so shared state is never mutated while the generator is live. The page
 shows the long name as its header and the short name as the browser-tab title, with
 a small dialog to edit both, and a connection LED that tracks whether the node is
-answering. The page polls `/api/state` about once a second and draws 1-minute
+answering. The page follows your OS light/dark setting (`prefers-color-scheme`). The page polls `/api/state` about once a second and draws 1-minute
 sparkline history for packet rate, refresh rate, and core-0 load entirely
 client-side (nothing is logged on the device). All web inputs are bounds-checked and
 the JSON output is escaped, so no value entered through the page can break the node.

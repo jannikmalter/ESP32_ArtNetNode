@@ -12,7 +12,7 @@
  * platformio.ini — see the BUILD CONFIGURATION block below.
  */
 
-#define FIRMWARE_VERSION "1.9"
+#define FIRMWARE_VERSION "2.1"
 
 #include <stdio.h>
 #include <stdlib.h>
