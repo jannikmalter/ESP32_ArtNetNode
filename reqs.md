@@ -1,6 +1,6 @@
 # ESP32 ArtNetNode — Requirements
 
-Status: Active · Updated: 2026-06-23
+Status: Active · Updated: 2026-06-26
 
 Single source of truth for the firmware ([src/main.c](src/main.c)). Consolidates
 the former `requirements.md` and `bugs.md`. Covers goals, functional requirements
@@ -19,6 +19,7 @@ Why this exists. Everything below traces to one of these.
 - **G3** — Bounds-checked handling of all untrusted network input.
 - **G4** — No external libraries; interface ESP-IDF directly.
 - **G5** — One codebase for both target boards (Olimex ESP32-POE deployed, WT32-ETH01 secondary) and both device variants (rack, mini).
+- **G6** — Field-serviceable: configure and update the deployed node over the network, without USB reflashing or physical access.
 
 ## Out of scope
 What this deliberately will *not* do (derived from project notes, not new policy).
@@ -35,7 +36,7 @@ One row each. Use "shall". `Type`: F=function, Q=quality, C=constraint.
 | ID | Type | Requirement | Pri | Goal | Done | Notes |
 |----|------|-------------|-----|------|------|-------|
 | R1 | F | The node shall act as an Art-Net to DMX node | M | G1 | ☑ | |
-| R5 | C | The firmware shall use separate tasks for UDP ingest, TCP config, and DMX generation | M | G2 | ☑ | `eth_task` / `tcp_task` / `dmx_task` |
+| R5 | C | The firmware shall use separate tasks for UDP ingest, config, and DMX generation | M | G2 | ☑ | `eth_task` / `httpd` (web UI) / `dmx_task`; config task was `tcp_task` until the TCP CLI was removed (R4/R17) |
 | R6 | F | The node shall persist settings to NVS | M | G1 | ☑ | namespace `"storage"` |
 | R7 | C | The firmware shall use no external libraries; ESP-IDF APIs only | M | G4 | ☑ | |
 
@@ -68,9 +69,19 @@ One row each. Use "shall". `Type`: F=function, Q=quality, C=constraint.
 
 | ID | Type | Requirement | Pri | Goal | Done | Notes |
 |----|------|-------------|-----|------|------|-------|
-| R4 | F | The node shall support runtime configuration over a raw TCP interface (port 1337) | M | G1 | ☑ | `tcp_task` |
-| R17 | F | Patch and settings shall be configurable over the raw TCP interface | M | G1 | ☑ | `PATCH` / `SYNC` / `SYNC_ADDR` / `NUM_CHAN` |
-| R23 | F | The node shall replace the TCP CLI with a minimal web UI exposing the same settings and live state | S | G1 | ☐ | `esp_http_server` only (R7); reuse stop/start + NVS handshake; replaces R4/R17; see [reqs/R23.md](reqs/R23.md), T8 |
+| R4 | F | ~~The node shall support runtime configuration over a raw TCP interface (port 1337)~~ | M | G1 | ☑ | **Removed 2026-06-26** — superseded by R23 (web UI). `tcp_task` deleted; port 1337 no longer served |
+| R17 | F | ~~Patch and settings shall be configurable over the raw TCP interface~~ | M | G1 | ☑ | **Removed 2026-06-26** — superseded by R23. Same settings now configured via the web UI `/api/config` |
+| R23 | F | The node shall replace the TCP CLI with an interactive web UI exposing the same settings and live state | M | G6 | ☑ | Web UI on `esp_http_server` (port 80, core 0): `/`, `/api/state`, `/api/config`, `/api/ota`; reuses stop/start + NVS handshake. **TCP CLI removed 2026-06-26** (R4/R17 retired). See [reqs/R23.md](reqs/R23.md), T8 |
+| R27 | Q | The web UI shall be lightweight, fast-loading, and visually polished | S | G6 | ☑ | single self-contained page ~8.5 KB (config + live graphs + OTA upload), served from flash, no CDNs/libs (R7), responsive; [src/index.html](src/index.html) |
+| R28 | F | The web UI shall display rolling 1-minute history graphs of Art-Net packet rate and DMX refresh rate, built client-side from periodic state polls (no on-device logging) | S | G6 | ☑ | firmware counts Art-Net packets/sec in `eth_task`, exposes it as `pps` in `/api/state`; graphs drawn client-side in [src/index.html](src/index.html). See [reqs/R28.md](reqs/R28.md), T13 |
+| R29 | F | The node shall measure and report core-0 CPU utilization, shown in the web UI as a live value and 1-minute history graph | S | G2 | ☑ | `stats_task` computes load from core-0 IDLE run-time over a 1 s window (FreeRTOS run-time stats); exposed as `load0` in `/api/state`, graphed client-side. Core 1 is unmeasurable by design (owns its core in a critical section). Needs `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`. See [reqs/R29.md](reqs/R29.md), T14 |
+
+### Firmware update (OTA)
+
+| ID | Type | Requirement | Pri | Goal | Done | Notes |
+|----|------|-------------|-----|------|------|-------|
+| R26 | F | The node shall support OTA firmware update by uploading an image through the web UI | M | G6 | ☑ | primary OTA channel; `POST /api/ota` streams the raw image through `esp_ota_begin/write/end` into the inactive slot then reboots, under the `stopDMX()`/`startDMX()` handshake (DMX fully stopped during update); dual slots + rollback-confirm foundation already in place; upload control + progress in [src/index.html](src/index.html). See [reqs/R26.md](reqs/R26.md), T10-T11 |
+| R25 | F | The node shall, where the protocol proves tractable, also accept OTA over the ArduinoOTA/espota protocol so PlatformIO's `upload_protocol = espota` flashes it directly | C | G6 | ☐ | conditional on a protocol-feasibility spike; reuses PlatformIO's bundled `espota.py` as host, no bespoke host program; see [reqs/R25.md](reqs/R25.md), T12 |
 
 ### Hardware targets & build
 
@@ -96,11 +107,10 @@ the deployed Olimex setup) is noted in the detail files.
 
 | ID | Bug | Ref | Sev | Done |
 |----|-----|-----|-----|------|
-| B7 | recvfrom and socket errors unhandled (unsigned length, unchecked socket fd) | R21 | Md | ☐ |
 | B11 | `num_chan` not clamped on NVS load | R12 | Lo | ☐ |
 | B12 | Hardcoded "Rack" node name regardless of variant (cosmetic) | R20 | Lo | ☐ |
 
-Detail: [reqs/B7.md](reqs/B7.md), [reqs/B11.md](reqs/B11.md), [reqs/B12.md](reqs/B12.md).
+Detail: [reqs/B11.md](reqs/B11.md), [reqs/B12.md](reqs/B12.md).
 
 ### Fixed
 
@@ -114,6 +124,7 @@ Detail: [reqs/B7.md](reqs/B7.md), [reqs/B11.md](reqs/B11.md), [reqs/B12.md](reqs
 | B8 | Robustness | Unchecked `calloc` / `nvs_open` / task-create / `esp_netif_new` returns | R1 | Lo | ☑ | Log + `esp_restart()` on boot-critical failures; save paths call `startDMX()` on `nvs_open` failure |
 | B9 | DMX init | Signed `1 <<` shift in bitmask build (UB at pin 31) | R3 | Lo | ☑ | Use `1u <<` |
 | B10 | DMX core | Read-modify-write `\|=` on W1TS/W1TC registers | R8 | Lo | ☑ | Plain `=` write |
+| B7 | Art-Net ingest | recvfrom/socket errors unhandled: unsigned length made a `-1` return look like `0xFFFFFFFF` and process a stale buffer; socket fd unchecked | R21 | Md | ☑ | Signed `recv_len` / `s`; check `socket()` (restart on failure); added `SO_RCVTIMEO` so an idle `recvfrom` returns `-1` and is skipped by the `>= 10` guard (landed with R28's packets/sec window) |
 | B13 | Timing | `vTaskDelay` tick-vs-ms mismatch in `eth_task` reconfig poll | R13 | Lo | ☑ | Use `vTaskDelay(1)` |
 | B14 | Concurrency | `stopDMX` used a fixed-delay timing assumption; shared flags not `volatile` | R5 | Lo | ☑ | Added `dmxStopped` ack handshake; `stopFlag` / `dmxStopped` / `trigger` marked `volatile` |
 
@@ -126,7 +137,7 @@ Detail: [reqs/B7.md](reqs/B7.md), [reqs/B11.md](reqs/B11.md), [reqs/B12.md](reqs
 
 ## Todos
 
-The development plan lives in [todo.md](todo.md) (items T1–T9), each referencing
+The development plan lives in [todo.md](todo.md) (items T1–T12), each referencing
 the requirement/bug ID it advances.
 
 ---

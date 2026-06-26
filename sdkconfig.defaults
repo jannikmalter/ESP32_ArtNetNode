@@ -11,3 +11,21 @@ CONFIG_ESP_DEFAULT_CPU_FREQ_MHZ_240=y
 # don't panic/trip; core 0 watchdogs stay enabled.
 CONFIG_ESP_INT_WDT_CHECK_CPU1=n
 CONFIG_ESP_TASK_WDT_CHECK_IDLE_TASK_CPU1=n
+
+# OTA foundation (R25/R26). Use the chip's real 4 MB flash (both Olimex ESP32-POE
+# and WT32-ETH01 ship 4 MB; the build previously capped it at 2 MB). The dual-slot
+# OTA partition table is selected by `board_build.partitions = partitions.csv` in
+# platformio.ini (PlatformIO overrides the sdkconfig partition choice), not here.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+CONFIG_ESPTOOLPY_FLASHSIZE="4MB"
+
+# Roll back to the previous app slot if a freshly OTA-written image fails to come
+# up. The new image boots in PENDING_VERIFY; app_main confirms it once bring-up
+# succeeds (see esp_ota_mark_app_valid_cancel_rollback in src/main.c).
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
+
+# FreeRTOS run-time stats (R29): per-task busy-time accounting so stats_task can
+# compute core-0 CPU load from the core-0 idle task's run-time. esp_timer is the
+# clock source. Board-independent; does not affect the cycle-counted DMX core.
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
+CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y

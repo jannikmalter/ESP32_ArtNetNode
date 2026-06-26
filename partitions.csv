@@ -1,0 +1,16 @@
+# ESP32 ArtNetNode — dual-slot OTA partition table (4 MB flash)
+#
+# Two app slots (ota_0 / ota_1) plus otadata let the firmware be updated over the
+# network: the node runs one slot, writes the new image into the other, then
+# switches and reboots (with bootloader rollback if the new image fails). There is
+# no factory and no phy_init partition — this is an Ethernet-only node with no
+# WiFi PHY init data. First boot (empty otadata) runs ota_0.
+#
+# Layout fills the 4 MB exactly with no alignment gaps: nvs+otadata end on the
+# 0x10000 boundary the app partitions must align to.
+#
+# Name,     Type, SubType, Offset,    Size,     Flags
+nvs,        data, nvs,     0x9000,    0x5000,
+otadata,    data, ota,     0xe000,    0x2000,
+ota_0,      app,  ota_0,   0x10000,   0x1F0000,
+ota_1,      app,  ota_1,   0x200000,  0x1F0000,

@@ -2,7 +2,7 @@
 
 Firmware that turns an ESP32 Ethernet board into an Art-Net → DMX512 node.
 Receives Art-Net DMX over wired Ethernet, generates seven DMX512 outputs by
-software bit-banging, exposes a raw-TCP command interface for configuration, and
+software bit-banging, serves a web UI for configuration and live monitoring, and
 answers ArtPoll discovery.
 
 Reliability and deterministic timing are primary requirements (live lighting).
@@ -10,7 +10,7 @@ Interfaces ESP-IDF directly, no external libraries.
 
 - **Art-Net in:** UDP, port `6454`, wired Ethernet (RMII + LAN87xx PHY)
 - **DMX out:** 7 × DMX512, software bit-bang at 250 kbaud
-- **Config:** raw TCP line protocol, port `1337`
+- **Config:** web UI on port `80` (config, live graphs, OTA upload)
 - **Discovery:** responds to ArtPoll with ArtPollReply
 - **Persistence:** configuration stored in NVS
 - **Targets:** Olimex ESP32-POE (deployed) and WT32-ETH01 (secondary), `rack`/`mini` variants
@@ -23,7 +23,7 @@ Interfaces ESP-IDF directly, no external libraries.
 - [Supported hardware](#supported-hardware)
 - [DMX512 bit-bang engine](#dmx512-bit-bang-engine)
 - [Art-Net & network](#art-net--network)
-- [TCP configuration interface](#tcp-configuration-interface)
+- [Web configuration interface](#web-configuration-interface)
 - [Persistence (NVS)](#persistence-nvs)
 - [Building, flashing, monitoring](#building-flashing-monitoring)
 - [Required sdkconfig settings](#required-sdkconfig-settings)
@@ -35,17 +35,18 @@ Interfaces ESP-IDF directly, no external libraries.
 
 ## Architecture
 
-Three tasks across the ESP32's two cores. Core 1 is dedicated to DMX generation;
-the two network tasks run on core 0 so they cannot disturb DMX timing.
+Core 1 is dedicated to DMX generation; the network tasks run on core 0 so they
+cannot disturb DMX timing.
 
 ```mermaid
 flowchart LR
     C[Lighting controller] -- "Art-Net / UDP :6454" --> E
-    A[Config client] -- "raw TCP :1337" --> T
+    A[Browser] -- "HTTP :80" --> H
 
     subgraph core0 [Core 0 - networking]
         E[eth_task<br/>Art-Net in + ArtPoll]
-        T[tcp_task<br/>config server]
+        H[httpd<br/>web UI + OTA]
+        ST[stats_task<br/>core-0 load]
     end
 
     subgraph core1 [Core 1 - real-time, exclusive]
@@ -54,7 +55,7 @@ flowchart LR
 
     E -- "memcpy into" --> B[(DMXbuf<br/>7 x 512 bytes)]
     B --> D
-    T -- "stop / start + NVS write" --> S[(config state)]
+    H -- "stop / start + NVS write" --> S[(config state)]
     S --> D
     D -- "7 GPIO, parallel bit-bang" --> O[7 x DMX512 outputs]
 ```
@@ -63,14 +64,16 @@ flowchart LR
 |---|---|---|---|
 | `dmx_task` | 1 | `configMAX_PRIORITIES-1` | Bit-bangs DMX inside a critical section; owns core 1 |
 | `eth_task` | 0 | idle + 2 | Receives Art-Net UDP (port `6454`), writes `DMXbuf`, answers ArtPoll |
-| `tcp_task` | 0 | idle (raised while a client is connected) | Config server (port `1337`) |
+| `httpd` | 0 | default (5) | Web UI + OTA upload (port `80`) |
+| `stats_task` | 0 | idle + 1 | Samples core-0 CPU load once a second |
 
 Cross-task coordination uses a stop/start handshake, not locks. To change shared
-state (patch table, sync settings, channel count), `tcp_task` calls `stopDMX()`,
-which sets `stopFlag` and waits for `dmx_task` to acknowledge (`dmxStopped`) that
-it has left the critical section. NVS is written and buffers mutated only after
-that; `startDMX()` resumes the generator. `eth_task` also pauses while `stopFlag`
-is set. DMX output is never reconfigured mid-frame.
+state (patch table, sync settings, channel count), the config path calls
+`stopDMX()`, which sets `stopFlag` and waits for `dmx_task` to acknowledge
+(`dmxStopped`) that it has left the critical section. NVS is written and buffers
+mutated only after that; `startDMX()` resumes the generator. `eth_task` also pauses
+while `stopFlag` is set. DMX output is never reconfigured mid-frame. OTA firmware
+writes use the same handshake (DMX fully stopped during an update).
 
 ---
 
@@ -126,7 +129,7 @@ are driven in parallel.
 - Variable frame length: a frame ends at `(num_chan + 1) * 11 + BREAK + MAB`.
   Lowering `num_chan` (1..512 channels per output) shortens the frame and raises
   the refresh rate, which is measured from the cycle delta between frames and
-  reported over the TCP interface.
+  reported in the web UI (`/api/state`).
 - Sync or free-run: when `synchronize` is set, the generator stalls the break
   until `eth_task` sets `trigger` (an ArtDMX frame for `sync_addr` arrives), with
   a ~0.2 s failsafe timeout so it cannot hang. Otherwise it free-runs.
@@ -135,8 +138,8 @@ are driven in parallel.
 
 - `GPIO_patch[7]`: physical GPIO for each output, in device order. Chosen at
   compile time per board + variant.
-- `DMX_patch[7]`: Art-Net universe feeding each output. Set via the `PATCH`
-  command, persisted to NVS.
+- `DMX_patch[7]`: Art-Net universe feeding each output. Set via the web UI,
+  persisted to NVS.
 - `DMX_repatch[7]`: built by `update_dmx_ptr()`. If several outputs are patched to
   the same universe, they share one 512-byte buffer slot, so one universe can fan
   out to multiple physical outputs.
@@ -158,7 +161,7 @@ hand.
 | Item | Value |
 |---|---|
 | Art-Net UDP port | `6454` |
-| TCP config port | `1337` |
+| Web UI port | `80` |
 | Socket buffer | `1024` bytes |
 | ArtDMX opcode | `0x5000` |
 | ArtPoll opcodes handled | `0x2000`, `0x6000`, `0x7000` → reply `0x2100` |
@@ -176,50 +179,36 @@ universe equals `sync_addr`, the DMX generator is triggered.
 
 ---
 
-## TCP configuration interface
+## Web configuration interface
 
-Connect to `<device-ip>:1337` with any raw-TCP client (`nc`, `telnet`, PuTTY in
-raw mode). The protocol is line-based; CR/LF is stripped. On connect the device
-sends a banner and the current state, and echoes full state after every command.
+Browse to `http://<device-ip>/`. The device serves one self-contained page
+(config, live monitoring graphs, and firmware upload) from flash — no external
+CDNs, fonts, or JS/CSS libraries. The page is served by `esp_http_server` pinned
+to core 0. (This replaced the original raw-TCP CLI on port 1337, which has been
+removed.)
 
-| Command | Effect |
-|---|---|
-| `PATCH a b c d e f g` | Set the Art-Net universe for each of the 7 outputs; persists, rebuilds repatch |
-| `SYNC 0` / `SYNC 1` | Free-run vs. sync DMX output to an input universe; persists |
-| `SYNC_ADDR n` | Universe to sync to; persists |
-| `NUM_CHAN n` | Channels per output (clamped to 1..512); lower = higher refresh; persists |
+| Route | Method | Effect |
+|---|---|---|
+| `/` | GET | The config + monitoring page |
+| `/api/state` | GET | Flat JSON: firmware/board/variant, `patch[7]`, `sync`, `sync_addr`, `num_chan`, live `refresh`, `pps` (Art-Net packets/sec), `load0` (core-0 load) |
+| `/api/config` | POST | Query params `patch=a,…,g` · `sync=0\|1` · `sync_addr=n` · `num_chan=n` (any subset); applies + returns fresh state |
+| `/api/ota` | POST | Streams a raw firmware image into the inactive OTA slot, then reboots into it (see below) |
 
-Each setter runs the `stopDMX()` → write NVS → `startDMX()` handshake, so shared
-state is never mutated while the generator is live.
+Settings changes (`/api/config`) run the `stopDMX()` → write NVS → `startDMX()`
+handshake, so shared state is never mutated while the generator is live. The page
+polls `/api/state` about once a second and draws 1-minute sparkline history for
+packet rate, refresh rate, and core-0 load entirely client-side (nothing is logged
+on the device).
 
-Example session (`nc 192.168.1.50 1337`):
+### Firmware update (OTA)
 
-```
-LICHTFETISCH ArtNet Rack
-
-	OUTPUT	ADDRESS
-	1:	0
-	2:	0
-	3:	0
-	4:	0
-	5:	0
-	6:	0
-	7:	0
-
-	NUM_CHAN: 512
-
-	SYNC: 0
-	SYNC_ADDR: 0
-
-	refresh rate: 44.000000 Hz
-
-> PATCH 0 1 2 3 4 5 6
-> NUM_CHAN 128
-> SYNC 1
-> SYNC_ADDR 0
-```
-
-The full state block is re-sent after each command.
+The node uses the chip's full 4 MB flash with a dual-slot OTA partition table
+([partitions.csv](partitions.csv)) and bootloader rollback. To update: build the
+image, then upload `.pio/build/<env>/firmware.bin` through the web page. The node
+writes the inactive slot, validates, sets it as the boot partition, and reboots;
+DMX output is **stopped for the whole update** (do it between shows). An image that
+fails to come up is rolled back automatically by the bootloader, so a bad upload
+cannot brick the node.
 
 ---
 
@@ -268,9 +257,9 @@ If `pio` is not on PATH: on Windows it is at
 `%USERPROFILE%\.platformio\penv\Scripts`; on Linux/macOS it is
 `~/.platformio/penv/bin/pio`.
 
-`pio run` prints `Flash memory size mismatch ... Expected 4MB, found 2MB!`. The
-`esp32-poe` manifest declares 4 MB while `sdkconfig` pins 2 MB. Harmless and
-matches the deployed config.
+The build uses the chip's full 4 MB flash with a dual-slot OTA partition table
+([partitions.csv](partitions.csv), selected via `board_build.partitions`). The app
+uses ~22% of a ~1.94 MB slot.
 
 ---
 
@@ -320,30 +309,30 @@ low/floating at reset.
 ## Repository layout
 
 ```
-src/main.c            # the entire firmware (DMX engine, Art-Net, TCP, NVS, Ethernet)
+src/main.c            # the entire firmware (DMX engine, Art-Net, web UI, OTA, NVS, Ethernet)
+src/index.html        # web UI source (embedded into flash at build time)
 platformio.ini        # 4 build envs (2 boards x 2 variants)
 sdkconfig.defaults    # board-independent DMX-timing config, seeds every env
 CMakeLists.txt        # ESP-IDF project glue
 reqs.md               # requirements, goals, bugs (single source of truth)
 reqs/                 # per-item detail files (reqs/<ID>.md)
-todo.md               # development plan (T1-T9)
+todo.md               # development plan
 info.md               # internal how-the-code-works documentation
 docs/                 # bulky reference (art-net.pdf, ANSI E1.11 DMX512 standard)
 CLAUDE.md             # minimal LLM-specific notes + imports
 ```
 
-`src/main.c` is a single translation unit. The DMX/Art-Net/TCP/NVS logic was
-ported verbatim from the original OLIMEX ESP32-POE firmware (ESP-IDF ~v4.0); the
-Ethernet bring-up was modernized to the ESP-IDF v5 API and parameterized for two
-boards. See [info.md](info.md) for port details.
+`src/main.c` is a single translation unit. The DMX/Art-Net/NVS logic was ported
+verbatim from the original OLIMEX ESP32-POE firmware (ESP-IDF ~v4.0); the Ethernet
+bring-up was modernized to the ESP-IDF v5 API and parameterized for two boards, and
+the web UI / OTA were added on top. See [info.md](info.md) for port details.
 
 ---
 
 ## Known limitations
 
-- Hardcoded node name. The ArtPollReply and TCP banner announce
-  `LICHTFETISCH ArtNet Rack` / `LF Rack` regardless of build, so a `mini` build
-  reports "Rack" on the network.
+- Hardcoded node name. The ArtPollReply announces `LICHTFETISCH ArtNet Rack` /
+  `LF Rack` regardless of build, so a `mini` build reports "Rack" on the network.
 - No Wi-Fi/BT on Olimex. The Olimex clock uses the internal APLL (`EMAC_CLK_OUT`);
   per ESP32 errata this precludes simultaneous Wi-Fi/BT.
 - WT32-ETH01 is untested. Pin maps are placeholders; no WT32 device has been built.

@@ -1,0 +1,163 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<link rel="icon" href="data:,">
+<title>ArtNetNode</title>
+<style>
+:root{--bg:#11151c;--card:#1b212b;--fg:#e8edf2;--mut:#8b97a6;--line:#2a323d;--acc:#4da3ff;--ok:#3ecf8e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:15px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif}
+.wrap{max-width:560px;margin:0 auto;padding:28px 16px 56px}
+h1{font-size:20px;margin:0 0 2px;letter-spacing:.2px}
+.sub{color:var(--mut);font-size:13px;margin-bottom:22px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px;margin-bottom:16px}
+label{display:block;color:var(--mut);font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
+input,select{width:100%;background:#0d1117;border:1px solid var(--line);color:var(--fg);border-radius:8px;padding:9px 10px;font-size:15px;outline:none;transition:border-color .15s}
+input:focus,select:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(77,163,255,.15)}
+input[type=number]{-moz-appearance:textfield}
+input[type=number]::-webkit-outer-spin-button,input[type=number]::-webkit-inner-spin-button{-webkit-appearance:none;margin:0}
+.grid{display:grid;grid-template-columns:repeat(7,1fr);gap:6px}
+.grid .o{text-align:center;color:var(--mut);font-size:11px;margin-bottom:4px}
+.grid input{text-align:center;padding:9px 3px}
+.grid .live{text-align:center;font-size:13px;font-variant-numeric:tabular-nums;color:var(--ok);background:#0d1117;border:1px solid var(--line);border-radius:8px;padding:6px 3px;margin-bottom:6px}
+.grid .live.diff{color:var(--acc);border-color:var(--acc)}
+.hint{color:var(--mut);font-size:11px;margin:-4px 0 10px}
+.row{display:flex;gap:12px}.row>div{flex:1}
+button{width:100%;background:var(--acc);color:#04101f;border:0;border-radius:8px;padding:13px;font-size:15px;font-weight:600;cursor:pointer;transition:background .15s}
+button:hover{background:#62b0ff}
+button:active{transform:translateY(1px)}
+.stat{display:flex;justify-content:space-between;align-items:center;color:var(--mut);font-size:13px}
+.stat b{color:var(--ok);font-size:18px;font-variant-numeric:tabular-nums}
+.graph{width:100%;height:60px;display:block;margin:8px 0 0;background:#0d1117;border:1px solid var(--line);border-radius:8px}
+.graph+.stat{margin-top:16px}
+.ax{color:var(--mut);font-size:11px;text-align:right;margin-top:6px}
+#msg{color:var(--mut);font-size:12px;text-align:center;height:16px;margin-top:10px}
+input[type=file]{padding:7px 8px;font-size:13px}
+.bar{display:none;height:8px;background:#0d1117;border:1px solid var(--line);border-radius:6px;margin:12px 0 8px;overflow:hidden}
+.bar>span{display:block;height:100%;width:0;background:var(--acc);transition:width .2s}
+#otamsg{color:var(--mut);font-size:12px;text-align:center;height:16px;margin-top:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>ArtNetNode</h1>
+  <div class="sub" id="ident">connecting…</div>
+
+  <div class="card">
+    <label>Output &rarr; Universe</label>
+    <div class="hint">top = live from device &middot; bottom = edit, then Save</div>
+    <div class="grid" id="patch"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <div>
+        <label>Mode</label>
+        <select id="sync"><option value="0">Free-run</option><option value="1">Sync</option></select>
+      </div>
+      <div><label>Sync universe</label><input id="sync_addr" type="number" min="0"></div>
+      <div><label>Channels</label><input id="num_chan" type="number" min="1" max="512"></div>
+    </div>
+  </div>
+
+  <button onclick="save()">Save</button>
+  <div id="msg"></div>
+
+  <div class="card" style="margin-top:8px">
+    <div class="stat"><span>Art-Net packets/sec</span><b id="pps">&ndash;</b></div>
+    <canvas id="g_pps" class="graph"></canvas>
+    <div class="stat"><span>Refresh rate</span><b id="refresh">&ndash;</b></div>
+    <canvas id="g_ref" class="graph"></canvas>
+    <div class="stat"><span>Core&nbsp;0 load</span><b id="load0">&ndash;</b></div>
+    <canvas id="g_load" class="graph"></canvas>
+    <div class="ax">last 60 s</div>
+  </div>
+
+  <div class="card">
+    <label>Firmware update</label>
+    <div class="hint">upload firmware.bin &middot; DMX output stops during the update &middot; device reboots</div>
+    <input type="file" id="fw" accept=".bin">
+    <button onclick="ota()" style="margin-top:10px">Upload &amp; flash</button>
+    <div class="bar" id="otabar"><span id="otafill"></span></div>
+    <div id="otamsg"></div>
+  </div>
+</div>
+
+<script>
+var $=function(id){return document.getElementById(id)};
+function grid(){var h="";for(var i=0;i<7;i++)h+='<div><div class="o">'+(i+1)+'</div><div class="live" id="lv'+i+'">&ndash;</div><input type="number" min="0" id="p'+i+'"></div>';$("patch").innerHTML=h;}
+/* Client-side history (R28): up to 60 samples (~1 min at the 1 s poll). The ESP
+ * stores nothing — the browser accumulates and draws these. */
+var N=60,hPps=[],hRef=[],hLoad=[];
+function push(a,v){a.push(v);if(a.length>N)a.shift();}
+/* Sparkline: newest sample at the right edge, 0-baselined. Scales to the window
+ * max, or to fixedMax when given (used for the 0-100 % load graph). Plain canvas,
+ * no libraries (R7/R27). */
+function draw(id,a,color,fixedMax){
+  var c=$(id),dpr=window.devicePixelRatio||1,w=c.clientWidth,h=c.clientHeight;
+  c.width=w*dpr;c.height=h*dpr;var x=c.getContext("2d");x.scale(dpr,dpr);
+  x.clearRect(0,0,w,h);if(a.length<2)return;
+  var pad=5,max=fixedMax||Math.max.apply(null,a);if(max<=0)max=1;
+  var step=w/(N-1),off=N-a.length;
+  var px=function(i){return (off+i)*step},py=function(v){return h-pad-(v/max)*(h-2*pad)};
+  x.beginPath();x.moveTo(px(0),py(a[0]));
+  for(var i=1;i<a.length;i++)x.lineTo(px(i),py(a[i]));
+  x.strokeStyle=color;x.lineWidth=1.5;x.lineJoin="round";x.stroke();
+  x.lineTo(px(a.length-1),h-pad);x.lineTo(px(0),h-pad);x.closePath();
+  x.globalAlpha=.12;x.fillStyle=color;x.fill();x.globalAlpha=1;
+  if(fixedMax||max>1){x.fillStyle="#8b97a6";x.font="10px system-ui";x.textAlign="left";
+    x.fillText(Math.round(max)+"",4,11);}
+}
+/* live(): refresh the read-only device row every poll; never touches the edit
+ * inputs (would clobber what the user is typing). Flags any output whose edit
+ * box diverges from the device's actual value so unsaved changes are visible.
+ * Also appends to the history graphs. */
+function live(s){
+  for(var i=0;i<7;i++){var el=$("lv"+i);el.textContent=s.patch[i];
+    el.className="live"+(((($("p"+i).value)|0)!==s.patch[i])?" diff":"");}
+  $("refresh").textContent=s.refresh.toFixed(1)+" Hz";
+  $("pps").textContent=(s.pps|0)+"/s";
+  $("load0").textContent=(s.load0|0)+"%";
+  push(hPps,s.pps|0);push(hRef,s.refresh);push(hLoad,s.load0|0);
+  draw("g_pps",hPps,"#4da3ff");draw("g_ref",hRef,"#3ecf8e");draw("g_load",hLoad,"#f0a73f",100);
+}
+/* fill(): seed the editable controls from the device — only on first load and
+ * right after a successful Save, so it never overwrites in-progress edits. */
+function fill(s){
+  $("ident").textContent=s.board+" · "+s.variant+" · fw "+s.fw;
+  for(var i=0;i<7;i++)$("p"+i).value=s.patch[i];
+  $("sync").value=s.sync;$("sync_addr").value=s.sync_addr;$("num_chan").value=s.num_chan;
+  live(s);
+}
+function load(){fetch("/api/state").then(function(r){return r.json()}).then(fill)
+  .catch(function(){$("ident").textContent="offline"});}
+function save(){
+  var p=[];for(var i=0;i<7;i++)p.push($("p"+i).value|0);
+  var q="patch="+p.join(",")+"&sync="+$("sync").value+"&sync_addr="+($("sync_addr").value|0)+"&num_chan="+($("num_chan").value|0);
+  $("msg").textContent="saving…";
+  fetch("/api/config?"+q,{method:"POST"}).then(function(r){return r.json()}).then(function(s){
+    fill(s);$("msg").textContent="saved";setTimeout(function(){$("msg").textContent=""},1500);
+  }).catch(function(){$("msg").textContent="save failed"});
+}
+/* ota(): raw-stream the chosen .bin to /api/ota (octet-stream body, no multipart).
+ * XHR (not fetch) for the upload-progress events. The device blocks DMX, writes
+ * the inactive slot and reboots; the rollback foundation reverts a bad image. */
+function ota(){
+  var f=$("fw").files[0];if(!f){$("otamsg").textContent="pick a .bin first";return;}
+  if(!confirm("Flash "+f.name+" ("+((f.size/1024)|0)+" KB)?\nDMX output stops and the device reboots."))return;
+  var x=new XMLHttpRequest();x.open("POST","/api/ota");
+  $("otabar").style.display="block";$("otafill").style.width="0";$("otamsg").textContent="uploading…";
+  x.upload.onprogress=function(e){if(e.lengthComputable)$("otafill").style.width=(100*e.loaded/e.total).toFixed(0)+"%";};
+  x.onload=function(){if(x.status==200){$("otafill").style.width="100%";$("otamsg").textContent="flashed — rebooting, reconnect in ~10 s";}
+    else $("otamsg").textContent="failed: "+(x.responseText||x.status);};
+  x.onerror=function(){$("otamsg").textContent="upload error";};
+  x.send(f);
+}
+grid();load();
+setInterval(function(){fetch("/api/state").then(function(r){return r.json()})
+  .then(live).catch(function(){});},1000);
+</script>
+</body>
+</html>

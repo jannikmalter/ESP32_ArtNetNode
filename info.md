@@ -14,7 +14,7 @@ hardware actually built so far) and WT32-ETH01.**
 
 - Receives Art-Net DMX data over **UDP via wired Ethernet**.
 - Generates **DMX512 output on seven GPIO pins** via software bit-banging.
-- Configurable at runtime over a **raw TCP command interface**.
+- Configurable at runtime over a **web UI** (the former raw TCP CLI was removed).
 - Responds to **ArtPoll** discovery so it appears in lighting controllers.
 - Persists configuration to **NVS** (non-volatile storage).
 
@@ -59,8 +59,9 @@ hardware is the **Olimex ESP32-POE**; WT32-ETH01 is the secondary target.
   `IP_EVENT_ETH_GOT_IP`; startup log prints board + variant.
 - **v4→v5 fix:** `GPIO_PIN_INTR_DISABLE` → `GPIO_INTR_DISABLE` in `dmx_task`.
 
-Everything else — `dmx_task`, `eth_task`, `tcp_task`, NVS save/load,
-`update_dmx_ptr` — is the original logic unchanged.
+Everything else — `dmx_task`, `eth_task`, NVS save/load, `update_dmx_ptr` — is the
+original logic unchanged. (The original raw TCP config CLI `tcp_task` was later
+removed in favour of the web UI — R23/R4/R17.)
 
 ## The DMX512 bit-bang engine (`dmx_task` in `src/main.c`)
 
@@ -93,6 +94,12 @@ This is the heart of the project. See [src/main.c:170](src/main.c#L170). How it 
 - **Safe reconfiguration**: `stopDMX()` sets `stopFlag` (generator exits the
   critical section and idles) → write NVS / change buffers → `startDMX()` clears
   it. `eth_task` also pauses on `stopFlag`.
+- **Parked at boot**: `stopFlag` starts **set**, so DMX output and Art-Net input
+  stay parked through all of `app_main`; `startDMX()` is called **last**, only once
+  boot has fully succeeded. This keeps every boot-time flash op safe (the bit-bang
+  generator never holds core 1's critical section while the cache is stopped — see
+  [Firmware update (OTA)](#firmware-update-ota)) and means a boot that faults out
+  never drives the lines with half-initialised state.
 
 ### Output multiplexing model
 
@@ -235,10 +242,13 @@ on this Linux box it lives at `~/.platformio/penv/bin/pio` (invoke with the full
 path); on Windows the venv is `%USERPROFILE%\.platformio\penv\Scripts` — add it to
 PATH or use the VS Code PlatformIO toolbar.
 
-A `pio run` prints a benign `Flash memory size mismatch … Expected 4MB, found 2MB!`
-warning: the `esp32-poe` board manifest declares the chip's real 4 MB, while
-`sdkconfig.*` pins `CONFIG_ESPTOOLPY_FLASHSIZE="2MB"`. Harmless (the firmware uses
-~38% of the 1 MB app partition) and matches the deployed config — not an error.
+The build uses the chip's full **4 MB flash** (`CONFIG_ESPTOOLPY_FLASHSIZE="4MB"`
+in [sdkconfig.defaults](sdkconfig.defaults)) with a **dual-slot OTA partition
+table** ([partitions.csv](partitions.csv), selected via `board_build.partitions`
+in [platformio.ini](platformio.ini)) — see [Firmware update (OTA)](#firmware-update-ota).
+The firmware uses ~20% of a ~1.94 MB app slot. (Earlier single-env builds capped
+flash at 2 MB and printed a benign `Flash memory size mismatch` warning; that is
+gone now that the config matches the real 4 MB.)
 
 ## sdkconfig: what DMX timing requires
 
@@ -258,9 +268,73 @@ These match the original working OLIMEX config. `sdkconfig.defaults` only **seed
 a fresh config — if you need to change one of these later, do it via `menuconfig`
 (it edits the per-env `sdkconfig.<env>`), or delete the generated file to re-seed.
 
-> The stale **`sdkconfig.wt32-eth01`** at the repo root belongs to the old
-> single-env layout (and has the wrong 160 MHz / watchdog settings). It's orphaned
-> now that envs are renamed; it can be deleted.
+`sdkconfig.defaults` also carries the **OTA foundation** settings, which are
+likewise board-independent: `CONFIG_ESPTOOLPY_FLASHSIZE="4MB"` and
+`CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`. The partition *table* itself is **not**
+set here — PlatformIO overrides the sdkconfig partition choice, so it is selected
+by `board_build.partitions = partitions.csv` in [platformio.ini](platformio.ini)
+(a sdkconfig `CONFIG_PARTITION_TABLE_CUSTOM_FILENAME` is silently ignored under the
+PlatformIO ESP-IDF build). See [Firmware update (OTA)](#firmware-update-ota).
+
+Finally it enables **FreeRTOS run-time stats** for the core-0 CPU-load metric
+(**R29**): `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y` (which auto-selects
+`FREERTOS_USE_TRACE_FACILITY`) with `CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y`.
+Board-independent and harmless to the DMX core (the bit-bang bypasses the scheduler).
+**Note:** because `sdkconfig.defaults` only *seeds*, adding these meant deleting the
+already-generated `sdkconfig.olimex-*` files so they re-seed — existing checkouts
+must do the same (or set the options via `menuconfig`) to pick them up.
+
+## Firmware update (OTA)
+
+The node is updated over the network (goal **G6**; reqs **R25**/**R26**, todo
+**T10**/**T11**). The web-UI upload path (**R26**) is implemented: build the image,
+then upload `firmware.bin` through the web page. The optional ArduinoOTA/espota
+responder (**R25**) is still to come.
+
+**Flash & partitions.** Uses the real 4 MB flash with a dual-slot OTA layout
+([partitions.csv](partitions.csv)): `ota_0`/`ota_1` (~1.94 MB each) + `otadata`, no
+factory/phy_init partition. The node runs one slot and writes the next image into
+the other; `otadata` then selects the new slot on reboot. First boot (empty
+`otadata`) runs `ota_0`. The table is selected by `board_build.partitions` in
+[platformio.ini](platformio.ini) (PlatformIO ignores the sdkconfig partition
+filename — see the sdkconfig section above).
+
+**Rollback.** `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`. A freshly OTA-written
+image boots `PENDING_VERIFY`; if it crashes before being confirmed, the bootloader
+reverts to the previous slot. `app_main` confirms the running image
+(`esp_ota_mark_app_valid_cancel_rollback`) once Ethernet and the DMX/network tasks
+have started — end of `app_main` in [src/main.c](src/main.c). USB-flashed images
+are `UNDEFINED` and left untouched (no rollback), so a normal `pio run -t upload`
+is unaffected.
+
+> **Why DMX is parked through boot (the confirm is a flash op).**
+> `esp_ota_get_running_partition()` / `esp_ota_mark_app_valid_cancel_rollback()`
+> touch flash, which disables the flash cache on **both** cores and needs core 1 to
+> answer a cross-core cache-stop. `dmx_task` holds core 1 inside
+> `vPortEnterCritical()` with interrupts off **forever** while live, so it can never
+> answer — running the confirm with DMX live **deadlocks core 0** (the task WDT then
+> trips on `IDLE0`). That's why `stopFlag` starts set and `startDMX()` runs *after*
+> the confirm: the whole boot, this confirm included, runs with the generator parked
+> out of its critical section. The same applies to the future `esp_ota_begin/write/
+> end` path — it must run under the `stopDMX()`/`startDMX()` handshake.
+
+**Web-UI upload (R26 / T11, done).** `ota_post_handler` serves `POST /api/ota`. The
+browser streams the raw `firmware.bin` as the octet-stream request body; the handler
+picks the inactive slot (`esp_ota_get_next_update_partition`), then
+`esp_ota_begin` → `esp_ota_write` (looping over `httpd_req_recv` chunks) →
+`esp_ota_end` (validates image magic/size/hash) → `esp_ota_set_boot_partition` →
+`esp_restart`. The new image boots `PENDING_VERIFY` and the `app_main` confirm above
+makes it permanent; an image that fails to come up rolls back. The whole handler runs
+under `stopDMX()` (DMX is **fully stopped for the entire update**, by decision — done
+between shows), so the flash writes never race the core-1 critical section; on any
+error it `esp_ota_abort`s and calls `startDMX()`, and the success path reboots. The
+upload control + XHR progress bar are in [src/index.html](src/index.html).
+
+> **Image file:** upload `.pio/build/<env>/firmware.bin` (the **app** image), not the
+> merged bootloader+partitions image. That is what `esp_ota_write` expects.
+
+**Still to do (T12).** The optional ArduinoOTA/espota responder for the PlatformIO
+Upload button (**R25**) — a separate front-end on the same `esp_ota_*` engine.
 
 ## Task / core layout
 
@@ -270,31 +344,79 @@ As implemented in `app_main` (unchanged from the original):
 |---|---|---|---|
 | `dmx_task` | **1** | `configMAX_PRIORITIES-1` | bit-bangs DMX, holds critical section (owns core 1) |
 | `eth_task` | 0 | idle+2 | UDP Art-Net in (port **6454**) |
-| `tcp_task` | 0 | idle (raised while client connected) | config server (port **1337**) |
+| `stats_task` | 0 | idle+1 | samples core-0 CPU load once a second (R29) |
+| `httpd` | **0** | default (5) | web config UI (port **80**); started by `start_webserver()` with `config.core_id = 0` |
 
-The two network tasks are on core 0 so `dmx_task` can monopolize core 1. Don't pin
+The network tasks are all on core 0 so `dmx_task` can monopolize core 1. The
+`esp_http_server` task **must** stay on core 0 (`config.core_id = 0`) — its default
+affinity is `tskNO_AFFINITY`, which could otherwise land it on core 1. Don't pin
 anything else to core 1.
 
-## TCP command interface
+## Web config interface (R23 / T8)
 
-Connect to `<device-ip>:1337` (raw TCP, line-based, CRLF stripped). On connect it
-sends a banner + current state; after every command it echoes full state via
-`get_state()`.
+`start_webserver()` in [src/main.c](src/main.c) runs an `esp_http_server` on **port
+80**, pinned to core 0. It is the **sole** runtime config interface and hosts the
+OTA upload endpoint (**R26**). The raw TCP CLI it replaced was **removed**
+(2026-06-26, R4/R17 retired — see [reqs/R23.md](reqs/R23.md)).
 
-| Command | Effect |
-|---|---|
-| `PATCH a b c d e f g` | set the Art-Net universe for each of the 7 outputs; persists, rebuilds repatch |
-| `SYNC 0\|1` | free-run vs. sync DMX output to an input universe; persists |
-| `SYNC_ADDR n` | which universe to sync to; persists |
-| `NUM_CHAN n` | channels per output (1–512); lower = higher refresh; persists |
+| Route | Method | Effect |
+|---|---|---|
+| `/` | GET | serves the embedded config page (`index_html`) |
+| `/api/state` | GET | flat JSON: fw/board/variant, `patch[7]`, `sync`, `sync_addr`, `num_chan`, live `refresh`, live `pps`, live `load0` |
+| `/api/config` | POST | query params `patch=a,b,…,g` · `sync=0\|1` · `sync_addr=n` · `num_chan=n` (any subset); applies + returns fresh state |
+| `/api/ota` | POST | raw firmware image (octet-stream body) → inactive OTA slot → reboot; see [Firmware update (OTA)](#firmware-update-ota) |
 
-Each setter calls `stopDMX()` → write NVS → `startDMX()` so it never mutates shared
-state while the generator is live.
+`/api/config` accepts the same settings the old TCP CLI did — `patch` (per-output
+universe), `sync`, `sync_addr`, `num_chan` — and applies them through the
+`save_dmx_patch()` / `save_sync_state()` path, inheriting the `stopDMX()` → NVS →
+`startDMX()` handshake so it never mutates live DMX state.
+
+### Live monitoring graphs (R28 / T13)
+
+`/api/state` also reports `pps` — **Art-Net packets per second**. `eth_task`
+increments a counter on every datagram that passes the `"Art-Net"` header check
+(all opcodes), and once `esp_timer_get_time()` shows >1 s since the last window it
+publishes the count into the `artnet_pps` global and restarts the window. The
+window check runs every loop iteration, and the UDP socket has a 250 ms
+`SO_RCVTIMEO`, so the rate **decays to 0 when Art-Net stops** (rather than holding
+the last value) — that's what makes it useful for spotting "no packets reaching the
+node" while debugging a rig. The idle `recvfrom` then returns `-1` each tick, which
+is why `recv_len` is signed and guarded (closed bug B7).
+
+`/api/state` also reports `load0` — **core-0 CPU utilization** (0-100 %, R29).
+`stats_task` (core 0) takes a `uxTaskGetSystemState()` snapshot once a second, reads
+the core-0 idle task's run-time counter (matched by handle), and computes
+`load0 = 100 * (1 - idle_busy / wall)` over the 1 s window. This needs FreeRTOS
+run-time stats — see the sdkconfig section. **Core 1 is intentionally not measured**:
+`dmx_task` owns it via a forever critical section (R9/R10), so its idle task never
+runs and any scheduler-based figure there would be meaningless (it is 100 %
+`dmx_task` by definition). The run-time-stats accounting lives entirely in the
+scheduler and does not perturb the cycle-counted DMX core.
+
+The web page polls `/api/state` ~once a second, keeps the last 60 samples of `pps`,
+`refresh` and `load0` client-side, and draws three `<canvas>` sparklines (newest
+sample at the right, 0-baselined; traffic/refresh auto-scale to the window max, load
+is fixed 0-100 %). **No history is stored on the ESP** — the firmware exposes only
+the instantaneous values; the browser builds the 1-minute window. No libraries/CDNs
+(R7/R27).
+
+### How the page is embedded
+
+The UI source is [src/index.html](src/index.html). A pre-build script
+([gen_web_assets.py](gen_web_assets.py), wired via `extra_scripts` in
+[platformio.ini](platformio.ini)) regenerates `src/web_assets.h` — a
+null-terminated `index_html[]` C array — before every build, and `main.c` serves it
+with `HTTPD_RESP_USE_STRLEN`. `web_assets.h` is git-ignored (generated). This
+indirection exists because PlatformIO's SCons build does **not** link IDF's
+`EMBED_TXTFILES` / `board_build.embed_txtfiles` cleanly on this platform version
+(the `.S` is generated but never linked → `undefined reference
+to _binary_index_html_start`). The script approach also extends to future assets
+(e.g. an OTA page): emit more arrays from the same source dir.
 
 ## Constants & wire format
 
-- Art-Net UDP port **6454** (`PORT`); TCP config port **1337** (`TCP_PORT`); socket
-  buffer **1024** (`BUFLEN`).
+- Art-Net UDP port **6454** (`PORT`); web UI on port **80**; socket buffer **1024**
+  (`BUFLEN`).
 - DMX timing: `BREAK` 30, `MAB` 10 bit-times; 11 bit-times/channel; 960 cycles/bit.
 - Art-Net opcodes (little-endian on the wire — note byte-swapped reads like
   `(buf[9]<<8)|buf[8]`): ArtDMX `0x5000`; ArtPoll `0x2000`/`0x6000`/`0x7000` →
@@ -305,8 +427,8 @@ state while the generator is live.
 
 ## Toolchain facts
 
-- Target project: ESP-IDF **v5.5.0**, ESP32 (dual-core Xtensa LX6), 2 MB flash,
-  single-app partition table.
+- Target project: ESP-IDF **v5.5.0**, ESP32 (dual-core Xtensa LX6), 4 MB flash,
+  dual-slot OTA partition table ([partitions.csv](partitions.csv)).
 - The OLIMEX original it was ported from used old ESP-IDF (~v4.0) — `component.mk`
   + legacy CMake `register_component()`.
 
@@ -317,10 +439,9 @@ state while the generator is live.
   `"ArtNetNode"` in `src/main.c`). Match surrounding style.
 - **Endianness:** Art-Net is little-endian; the manual byte assembly is
   intentional — keep it consistent.
-- **Known wart:** the ArtPollReply + TCP banner node name is still hardcoded
-  `"… Rack"` (carried over from the original) in `eth_task`/`tcp_task`, so a `mini`
-  build announces itself as "Rack" on the network. Parameterize by `VARIANT_NAME`
-  when this matters.
+- **Known wart:** the ArtPollReply node name is still hardcoded `"… Rack"` (carried
+  over from the original) in `eth_task`, so a `mini` build announces itself as
+  "Rack" on the network. Parameterize by `VARIANT_NAME` when this matters.
 - **`xthal_get_ccount()`** in `dmx_task` is the original's cycle counter; it still
   resolves on IDF v5 via the Xtensa FreeRTOS port. If a build ever can't find it,
   swap to `esp_cpu_get_cycle_count()` (`esp_cpu.h`) — same value.

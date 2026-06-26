@@ -1,17 +1,18 @@
 /*
  * ESP32 ArtNetNode  —  Art-Net -> DMX512 (7 outputs, software bit-bang)
  *
- * The DMX engine, Art-Net/UDP handling, TCP config interface and NVS logic are
- * ported VERBATIM from the original working OLIMEX ESP32-POE firmware
- * (ESP-IDF ~v4.0). Only the Ethernet bring-up has been modernized to the
- * ESP-IDF v5 API and parameterized to build for two boards, and one v4->v5 GPIO
- * enum name was fixed (GPIO_PIN_INTR_DISABLE -> GPIO_INTR_DISABLE in dmx_task).
+ * The DMX engine, Art-Net/UDP handling and NVS logic are ported VERBATIM from the
+ * original working OLIMEX ESP32-POE firmware (ESP-IDF ~v4.0). Only the Ethernet
+ * bring-up has been modernized to the ESP-IDF v5 API and parameterized to build
+ * for two boards, and one v4->v5 GPIO enum name was fixed (GPIO_PIN_INTR_DISABLE
+ * -> GPIO_INTR_DISABLE in dmx_task). The original raw TCP config CLI has since
+ * been removed in favour of the web UI (R23).
  *
  * Build configuration is selected at compile time via -D flags in
  * platformio.ini — see the BUILD CONFIGURATION block below.
  */
 
-#define FIRMWARE_VERSION "1.0"
+#define FIRMWARE_VERSION "1.2"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -25,11 +26,17 @@
 #include "esp_event.h"
 #include "esp_log.h"
 #include "esp_system.h"
+#include "esp_timer.h"        /* esp_timer_get_time() for the Art-Net pps window */
 #include "sdkconfig.h"
 
 #include "driver/gpio.h"
 #include "nvs_flash.h"
 #include "nvs.h"
+
+#include "esp_ota_ops.h"      /* OTA foundation (R25/R26): dual-slot update + rollback */
+#include "esp_partition.h"
+#include "esp_http_server.h"  /* Web config UI (R23) — replaced the raw TCP CLI */
+#include "web_assets.h"        /* index_html[] — generated from src/index.html */
 
 #include "soc/dport_reg.h"
 #include "soc/io_mux_reg.h"
@@ -117,7 +124,6 @@
 /* NODE CONFIG */
 #define BUFLEN 1024   /* Max length of buffer */
 #define PORT 6454     /* The port on which to listen for incoming Art-Net */
-#define TCP_PORT 1337
 
 #define BREAK 30
 #define MAB 10
@@ -130,13 +136,20 @@ uint_fast16_t DMX_patch[NUM_OUT] = {0, 0, 0, 0, 0, 0, 0};
 uint_fast8_t DMX_repatch[NUM_OUT] = {0, 0, 0, 0, 0, 0, 0};
 
 /* Cross-task reconfiguration handshake (no locks):
- *   stopFlag   - set by tcp_task (via stopDMX), polled by dmx_task & eth_task.
+ *   stopFlag   - set via stopDMX() by the config/OTA paths, polled by dmx_task & eth_task.
  *   dmxStopped - set by dmx_task once it has left vPortExitCritical and is
  *                idling; lets stopDMX *observe* the critical-section exit
  *                instead of assuming a fixed delay was long enough.
  * Both are written by one task and read by another, so they must be volatile
- * or the compiler may cache them in a register and never see the change. */
-volatile uint_fast8_t stopFlag = 0;
+ * or the compiler may cache them in a register and never see the change.
+ *
+ * stopFlag starts SET: DMX (and Art-Net input) are parked through the whole of
+ * app_main and only go live once boot has fully succeeded (app_main calls
+ * startDMX() last). This keeps every boot-time flash op safe — the bit-bang
+ * generator never holds core 1 in its interrupt-disabled critical section while
+ * the cache is being stopped — and means a boot that faults out never drives the
+ * DMX lines with half-initialised state. */
+volatile uint_fast8_t stopFlag = 1;
 volatile uint_fast8_t dmxStopped = 0;
 
 uint_fast8_t synchronize = 0;
@@ -145,6 +158,17 @@ uint_fast16_t num_chan = 0;
 volatile uint_fast8_t trigger = 0;
 
 float refresh_rate;
+
+/* Art-Net packets/sec, recomputed once a second in eth_task (R28). Read by the
+ * web UI via /api/state to drive the live traffic graph. Decays to 0 when Art-Net
+ * stops (the socket has a recv timeout so the window still fires). */
+volatile uint_fast16_t artnet_pps = 0;
+
+/* Core-0 CPU utilization 0..100 %, recomputed once a second by stats_task from
+ * the core-0 idle task's run-time (R29). Read by the web UI via /api/state. Core 1
+ * is intentionally not measured (dmx_task owns it via a forever critical section,
+ * so its idle task never runs). */
+volatile uint_fast8_t cpu_load0 = 0;
 
 /* Device IPv4 address in network byte order, captured from
  * IP_EVENT_ETH_GOT_IP and used to fill the IP field of ArtPollReply.
@@ -424,235 +448,6 @@ void update_dmx_ptr()
 	}
 }
 
-void removeCRLF(char* str, int len)
-{
-	uint8_t c;
-	uint_fast8_t i = 0;
-
-	if (str != NULL)
-	{
-		c = str[i];
-		while ((c != 0) && (i < len))
-		{
-			if (c == 10 || c == 13)
-			{
-				str[i] = 0;
-			}
-			i++;
-			c = str[i];
-		}
-	}
-}
-
-int get_state(char *replyBuf, int len)
-{
-	int n = 0;
-
-	memset(replyBuf, 0, len);
-	n = sprintf(replyBuf + n, "\r\n\tOUTPUT\tADDRESS\r\n");
-
-	for (uint_fast8_t i = 0; i < NUM_OUT; i++)
-		n = n + sprintf(replyBuf + n, "\t%u:\t%u\r\n", i+1, DMX_patch[i]);
-
-	n = n + sprintf(replyBuf + n, "\r\n");
-	n = n + sprintf(replyBuf + n, "\tNUM_CHAN: %u\r\n", num_chan);
-	n = n + sprintf(replyBuf + n, "\r\n");
-	n = n + sprintf(replyBuf + n, "\tSYNC: %s\r\n", (synchronize ? "1" : "0"));
-	n = n + sprintf(replyBuf + n, "\tSYNC_ADDR: %u\r\n", sync_addr);
-	n = n + sprintf(replyBuf + n, "\r\n");
-	n = n + sprintf(replyBuf + n, "\trefresh rate: %f Hz\r\n", refresh_rate);
-	n = n + sprintf(replyBuf + n, "\r\n");
-
-	return n;
-}
-
-void tcp_task()
-{
-
-	printf("TCP Task started\n");
-
-	int port = TCP_PORT;
-
-	uint_fast16_t n;
-
-	int server_fd, client_fd, err;
-	struct sockaddr_in server, client;
-
-	char *inputBuf;
-	char *replyBuf;
-
-	inputBuf = calloc(BUFLEN, sizeof(char));
-	replyBuf = calloc(BUFLEN, sizeof(char));
-	if (inputBuf == NULL || replyBuf == NULL)
-	{
-		ESP_LOGE(TAG, "tcp_task: buffer alloc failed");
-		esp_restart();
-	}
-
-	while (1)
-	{
-		printf("init socket\n");
-
-		vTaskDelay(1000 / portTICK_PERIOD_MS);   /* remove? */
-
-		server_fd = socket(AF_INET, SOCK_STREAM, 0);
-		if (server_fd < 0)
-		{
-			printf("could not create socket\n");
-			fflush(NULL);
-			break;
-		}
-
-		server.sin_family = AF_INET;
-		server.sin_port = htons(port);
-		server.sin_addr.s_addr = htonl(INADDR_ANY);
-
-		int opt_val = 1;
-		setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt_val, sizeof opt_val);
-
-		err = bind(server_fd, (struct sockaddr *)&server, sizeof(server));
-		if (err < 0)
-		{
-			printf("bind error\n");
-			fflush(NULL);
-			break;
-		}
-
-		err = listen(server_fd, 128);
-		if (err < 0)
-		{
-			printf("listen error\n");
-			fflush(NULL);
-			break;
-		}
-
-		printf("socket created\n");
-
-
-		while (1)
-		{
-
-			printf("waiting fot connection\n");
-
-
-			socklen_t client_len = sizeof(client);
-			client_fd = accept(server_fd, (struct sockaddr *)&client, &client_len);
-
-			if (client_fd < 0)
-				break;
-
-			vTaskPrioritySet(NULL, configMAX_PRIORITIES - 1);
-			printf("connection established\n");
-
-			memset(replyBuf, 0, BUFLEN);
-			n = sprintf(replyBuf, "LICHTFETISCH ArtNet Rack\r\n\r\n");
-			send(client_fd, replyBuf, n, 0);
-
-			n = get_state(replyBuf, BUFLEN);
-			send(client_fd, replyBuf, n, 0);
-
-
-
-			while (1)
-			{
-				printf("waiting for message\n");
-
-				memset(inputBuf, 0, BUFLEN);
-				int read = recv(client_fd, inputBuf, BUFLEN, 0);
-				inputBuf[BUFLEN - 1] = 0;
-
-				printf("message received\n");
-
-				if (!read)
-					break;
-
-				if (read <= 0)
-					break;
-
-				removeCRLF(inputBuf, read);
-
-				if (inputBuf[0] != 0)
-				{
-
-					char *token;
-					token = strtok(inputBuf, " ");
-
-					if (token == NULL)
-					{
-						/* line was only separators (spaces/CRLF) — ignore */
-					}
-
-					else if (strcmp(token, "PATCH") == 0)
-					{
-						uint_fast8_t i = 0;
-						token = strtok(NULL, " ");
-						while (token != NULL && i < NUM_OUT)
-						{
-							DMX_patch[i] = atoi(token);
-							token = strtok(NULL, " ");
-							i++;
-						}
-						save_dmx_patch();
-						update_dmx_ptr();
-					}
-
-					else if (strcmp(token, "SYNC") == 0)
-					{
-						token = strtok(NULL, " ");
-						if (token != NULL)
-						{
-							if (strcmp(token, "1") == 0)
-								synchronize = 1;
-							else
-								synchronize = 0;
-							save_sync_state();
-
-							printf("sync state saved\n");
-						}
-					}
-
-					else if (strcmp(token, "SYNC_ADDR") == 0)
-					{
-						token = strtok(NULL, " ");
-						if (token != NULL)
-						{
-							sync_addr = atoi(token);
-							save_sync_state();
-
-							printf("sync state saved\n");
-						}
-					}
-
-					else if (strcmp(token, "NUM_CHAN") == 0)
-					{
-						int input;
-						token = strtok(NULL, " ");
-						if (token != NULL)
-						{
-							input = atoi(token);
-							if (1>input) input = 1;
-							if (512<input) input = 512;
-							num_chan = input;
-							save_sync_state();
-
-							printf("sync state saved\n");
-						}
-					}
-				}
-
-				n = get_state(replyBuf, BUFLEN);
-				send(client_fd, replyBuf, n, 0);
-
-			}
-			close(client_fd);
-			vTaskPrioritySet(NULL, tskIDLE_PRIORITY);
-			printf("client disconnected\n");
-		}
-		close(server_fd);
-		printf("socket removed\n");
-	}
-}
-
 void eth_task()
 {
 	const char artnet_header[8] = "Art-Net";
@@ -666,7 +461,13 @@ void eth_task()
 	char *replyBuf;
 
 	struct sockaddr_in si_me, si_other;
-	uint32_t s, slen = sizeof(si_other), recv_len;
+	int s, recv_len;                 /* signed: recvfrom returns -1 on timeout/error (B7) */
+	uint32_t slen = sizeof(si_other);
+
+	/* Art-Net packets/sec window (R28): count packets and, once >1 s has elapsed,
+	 * publish the count and restart the window. */
+	uint_fast16_t pps_count = 0;
+	int64_t pps_t0 = esp_timer_get_time();
 
 	ArtNetBuf = calloc(BUFLEN, sizeof(char));
 	replyBuf = calloc(BUFLEN, sizeof(char));
@@ -677,6 +478,19 @@ void eth_task()
 	}
 
 	s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+	if (s < 0)
+	{
+		ESP_LOGE(TAG, "eth_task: socket() failed");
+		esp_restart();
+	}
+
+	/* Wake recvfrom every 250 ms even with no traffic, so the packets/sec window
+	 * below still runs during silence and the rate decays to 0 (R28) instead of
+	 * holding the last value — lets the web UI show "no packets reaching the node".
+	 * recvfrom then returns -1 (EAGAIN) on each idle tick, hence the signed
+	 * recv_len + the >= 10 guard (B7). */
+	struct timeval rcvto = { .tv_sec = 0, .tv_usec = 250000 };
+	setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &rcvto, sizeof(rcvto));
 
 	memset((char *)&si_me, 0, sizeof(si_me));
 	si_me.sin_family = AF_INET;
@@ -690,10 +504,23 @@ void eth_task()
 			vTaskDelay(1);
 
 		recv_len = recvfrom(s, ArtNetBuf, BUFLEN, 0, (struct sockaddr *)&si_other, &slen);
+
+		/* Publish packets/sec once per second, whether or not a packet arrived, so
+		 * the rate falls to 0 when Art-Net stops (R28). */
+		int64_t pps_now = esp_timer_get_time();
+		if (pps_now - pps_t0 >= 1000000)
+		{
+			artnet_pps = pps_count;
+			pps_count = 0;
+			pps_t0 = pps_now;
+		}
+
 		if (recv_len >= 10)
 		{
 			if (strcmp(ArtNetBuf, artnet_header) == 0)
 			{
+				pps_count++;   /* count every Art-Net packet (R28) */
+
 				opcode = ((uint8_t)ArtNetBuf[9] << 8) | (uint8_t)ArtNetBuf[8];
 				if (opcode == 0x5000 && recv_len >= 18)
 				{
@@ -745,6 +572,255 @@ void eth_task()
 			}
 		}
 	}
+}
+
+/* Core-0 CPU load monitor (R29). FreeRTOS run-time stats accumulate per-task busy
+ * time in esp_timer microseconds; core-0's idle task therefore accrues run-time
+ * only while core 0 is idle. Sampling it over a 1 s wall window gives
+ *   load0 = 100 * (1 - idle_busy / wall).
+ * No calibration needed (same time base), and the unsigned counter delta is taken
+ * modulo its width so a 32-bit wrap is harmless. Core 1 is deliberately not
+ * measured: dmx_task owns it via a forever critical section, so its idle task
+ * never runs and any scheduler-based figure is meaningless.
+ *
+ * This (non-SMP) IDF kernel has no ulTaskGetRunTimeCounter(), so the per-task
+ * run-time is read from a uxTaskGetSystemState() snapshot, matched by handle. */
+#define STATS_MAX_TASKS 32
+static configRUN_TIME_COUNTER_TYPE idle_runtime(TaskHandle_t idle, TaskStatus_t *st, UBaseType_t n)
+{
+	for (UBaseType_t i = 0; i < n; i++)
+		if (st[i].xHandle == idle)
+			return st[i].ulRunTimeCounter;
+	return 0;
+}
+
+void stats_task(void *arg)
+{
+	static TaskStatus_t st[STATS_MAX_TASKS];   /* ~1.4 KB, kept off the task stack */
+	TaskHandle_t idle0 = xTaskGetIdleTaskHandleForCore(0);
+	configRUN_TIME_COUNTER_TYPE total;
+
+	UBaseType_t n = uxTaskGetSystemState(st, STATS_MAX_TASKS, &total);
+	configRUN_TIME_COUNTER_TYPE prev_idle = idle_runtime(idle0, st, n);
+	int64_t prev_t = esp_timer_get_time();
+
+	while (1)
+	{
+		vTaskDelay(pdMS_TO_TICKS(1000));
+
+		n = uxTaskGetSystemState(st, STATS_MAX_TASKS, &total);
+		if (n == 0 || idle0 == NULL)   /* array too small / no idle handle */
+			continue;
+
+		configRUN_TIME_COUNTER_TYPE now_idle = idle_runtime(idle0, st, n);
+		int64_t now_t = esp_timer_get_time();
+		uint64_t idle_dt = (uint64_t)(now_idle - prev_idle);   /* busy us, modular */
+		int64_t  wall_dt = now_t - prev_t;                     /* elapsed us */
+
+		int load = 0;
+		if (wall_dt > 0)
+		{
+			load = 100 - (int)((idle_dt * 100) / (uint64_t)wall_dt);
+			if (load < 0)   load = 0;
+			if (load > 100) load = 100;
+		}
+		cpu_load0 = (uint_fast8_t)load;
+
+		prev_idle = now_idle;
+		prev_t = now_t;
+	}
+}
+
+/* ===========================================================================
+ *  WEB CONFIG UI  (R23 / T8)
+ *
+ *  A minimal esp_http_server, pinned to core 0 so it never touches the DMX core.
+ *  It is the sole config interface (the raw TCP CLI it replaced has been removed)
+ *  and reuses the exact same stopDMX() -> write NVS -> startDMX() save handshake
+ *  (save_dmx_patch / save_sync_state), so it never mutates live DMX state directly.
+ *
+ *  index.html is embedded into flash via EMBED_TXTFILES (see src/CMakeLists.txt).
+ *  This server also hosts the OTA upload endpoint (R26): the firmware-upload
+ *  handler registers on this same server instance.
+ * =========================================================================== */
+
+/* Flat JSON snapshot of all settings + live refresh rate (read by index.html). */
+static int build_state_json(char *buf, int len)
+{
+	int n = snprintf(buf, len, "{\"fw\":\"%s\",\"board\":\"%s\",\"variant\":\"%s\",\"patch\":[",
+	                 FIRMWARE_VERSION, BOARD_NAME, VARIANT_NAME);
+	for (uint_fast8_t i = 0; i < NUM_OUT; i++)
+		n += snprintf(buf + n, len - n, "%s%u", i ? "," : "", (unsigned)DMX_patch[i]);
+	n += snprintf(buf + n, len - n,
+	              "],\"sync\":%u,\"sync_addr\":%u,\"num_chan\":%u,\"refresh\":%.1f,\"pps\":%u,\"load0\":%u}",
+	              (unsigned)synchronize, (unsigned)sync_addr, (unsigned)num_chan,
+	              refresh_rate, (unsigned)artnet_pps, (unsigned)cpu_load0);
+	return n;
+}
+
+static esp_err_t root_get_handler(httpd_req_t *req)
+{
+	httpd_resp_set_type(req, "text/html");
+	return httpd_resp_send(req, index_html, HTTPD_RESP_USE_STRLEN);
+}
+
+static esp_err_t state_get_handler(httpd_req_t *req)
+{
+	char buf[256];
+	int n = build_state_json(buf, sizeof(buf));
+	httpd_resp_set_type(req, "application/json");
+	return httpd_resp_send(req, buf, n);
+}
+
+/* POST /api/config?patch=a,b,c,d,e,f,g&sync=0|1&sync_addr=n&num_chan=n
+ * Any subset of keys may be present; applies each via the shared save path, then
+ * returns the fresh state JSON. */
+static esp_err_t config_post_handler(httpd_req_t *req)
+{
+	char query[160];
+	char val[64];
+	uint_fast8_t save_patch = 0, save_sync = 0;
+
+	if (httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK)
+	{
+		if (httpd_query_key_value(query, "patch", val, sizeof(val)) == ESP_OK)
+		{
+			char *save;
+			uint_fast8_t i = 0;
+			for (char *tok = strtok_r(val, ",", &save); tok != NULL && i < NUM_OUT;
+			     tok = strtok_r(NULL, ",", &save))
+				DMX_patch[i++] = atoi(tok);
+			save_patch = 1;
+		}
+		if (httpd_query_key_value(query, "sync", val, sizeof(val)) == ESP_OK)
+		{
+			synchronize = (atoi(val) != 0);
+			save_sync = 1;
+		}
+		if (httpd_query_key_value(query, "sync_addr", val, sizeof(val)) == ESP_OK)
+		{
+			sync_addr = atoi(val);
+			save_sync = 1;
+		}
+		if (httpd_query_key_value(query, "num_chan", val, sizeof(val)) == ESP_OK)
+		{
+			int n = atoi(val);
+			if (n < 1) n = 1;
+			if (n > 512) n = 512;
+			num_chan = n;
+			save_sync = 1;
+		}
+	}
+
+	/* Reuse the proven stop/start + NVS handshake. PATCH order matters:
+	 * save (which stops/starts DMX), then rebuild the dedup repatch table. */
+	if (save_patch)
+	{
+		save_dmx_patch();
+		update_dmx_ptr();
+	}
+	if (save_sync)
+		save_sync_state();
+
+	char buf[256];
+	int n = build_state_json(buf, sizeof(buf));
+	httpd_resp_set_type(req, "application/json");
+	return httpd_resp_send(req, buf, n);
+}
+
+/* POST /api/ota — stream a raw firmware image (octet-stream request body) into
+ * the inactive OTA slot, then reboot into it. DMX is stopped for the *whole*
+ * update (deliberately — never flash during a show): with core 1 parked outside
+ * its critical section the flash writes can't race the cycle-counted bit-bang,
+ * and there is no DMX output until the device comes back up. On any error we
+ * abort the write and restart DMX; on success we reboot, handing off to the
+ * rollback foundation in app_main (an image that fails to confirm reverts to the
+ * previous slot, so a bad upload can't brick the node). ESP-IDF only (R7/R26). */
+static esp_err_t ota_post_handler(httpd_req_t *req)
+{
+	const esp_partition_t *part = esp_ota_get_next_update_partition(NULL);
+	if (part == NULL)
+	{
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "no OTA partition");
+		return ESP_FAIL;
+	}
+
+	ESP_LOGI(TAG, "OTA: receiving %d bytes -> %s", req->content_len, part->label);
+	stopDMX();   /* park core 1 for the whole update (flash cache stops on both cores) */
+
+	esp_ota_handle_t ota = 0;
+	if (esp_ota_begin(part, OTA_SIZE_UNKNOWN, &ota) != ESP_OK)
+	{
+		startDMX();
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_begin failed");
+		return ESP_FAIL;
+	}
+
+	char buf[1024];
+	int recv, total = 0;
+	while ((recv = httpd_req_recv(req, buf, sizeof(buf))) > 0)
+	{
+		if (esp_ota_write(ota, buf, recv) != ESP_OK)
+		{
+			esp_ota_abort(ota);
+			startDMX();
+			httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "esp_ota_write failed");
+			return ESP_FAIL;
+		}
+		total += recv;
+	}
+	if (recv < 0)   /* socket error / timeout mid-stream */
+	{
+		esp_ota_abort(ota);
+		startDMX();
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "recv failed");
+		return ESP_FAIL;
+	}
+
+	if (esp_ota_end(ota) != ESP_OK)   /* validates image magic / size / hash */
+	{
+		startDMX();
+		httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "invalid image");
+		return ESP_FAIL;
+	}
+	if (esp_ota_set_boot_partition(part) != ESP_OK)
+	{
+		startDMX();
+		httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "set_boot failed");
+		return ESP_FAIL;
+	}
+
+	ESP_LOGI(TAG, "OTA: %d bytes written, rebooting into %s", total, part->label);
+	httpd_resp_sendstr(req, "OK");
+	vTaskDelay(pdMS_TO_TICKS(500));   /* let the response flush before we reset */
+	esp_restart();
+	return ESP_OK;   /* not reached */
+}
+
+static void start_webserver(void)
+{
+	httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+	config.core_id = 0;            /* keep the HTTP task off core 1 (DMX) */
+	config.stack_size = 8192;
+	config.lru_purge_enable = true;
+
+	httpd_handle_t server = NULL;
+	if (httpd_start(&server, &config) != ESP_OK)
+	{
+		ESP_LOGE(TAG, "httpd_start failed");
+		return;
+	}
+
+	static const httpd_uri_t root  = { .uri = "/",           .method = HTTP_GET,  .handler = root_get_handler };
+	static const httpd_uri_t state = { .uri = "/api/state",  .method = HTTP_GET,  .handler = state_get_handler };
+	static const httpd_uri_t cfg   = { .uri = "/api/config", .method = HTTP_POST, .handler = config_post_handler };
+	static const httpd_uri_t ota   = { .uri = "/api/ota",    .method = HTTP_POST, .handler = ota_post_handler };
+	httpd_register_uri_handler(server, &root);
+	httpd_register_uri_handler(server, &state);
+	httpd_register_uri_handler(server, &cfg);
+	httpd_register_uri_handler(server, &ota);
+
+	ESP_LOGI(TAG, "Web UI started on http://<device-ip>/");
 }
 
 void app_main(void)
@@ -829,10 +905,48 @@ void app_main(void)
 
 	/* --- Tasks: network on core 0, DMX bit-bang alone on core 1 --- */
 	if (xTaskCreatePinnedToCore(eth_task, "eth_task", 2048, NULL, (tskIDLE_PRIORITY + 2), NULL, 0) != pdPASS ||
-	    xTaskCreatePinnedToCore(tcp_task, "tcp_task", 2048, NULL, (tskIDLE_PRIORITY), NULL, 0) != pdPASS ||
 	    xTaskCreatePinnedToCore(dmx_task, "dmx_task", 2018, NULL, (configMAX_PRIORITIES - 1), NULL, 1) != pdPASS)
 	{
 		ESP_LOGE(TAG, "task create failed");
 		esp_restart();
 	}
+
+	/* --- Web config UI (core 0); also the host for the future OTA endpoint --- */
+	start_webserver();
+
+	/* --- Core-0 CPU load monitor (R29), core 0, just above idle. Diagnostic, so a
+	 * failure here is logged but not fatal. --- */
+	if (xTaskCreatePinnedToCore(stats_task, "stats_task", 2048, NULL, (tskIDLE_PRIORITY + 1), NULL, 0) != pdPASS)
+		ESP_LOGW(TAG, "stats_task create failed; core-0 load unavailable");
+
+	/* --- OTA rollback confirm (R25/R26 foundation) ---
+	 * A freshly OTA-written image boots in the PENDING_VERIFY state; the
+	 * bootloader rolls it back to the previous slot on the next reset unless we
+	 * mark it valid. Reaching this point means boot, Ethernet bring-up and the
+	 * DMX/network tasks all started, so the image is good — confirm it.
+	 * USB-flashed images are in the UNDEFINED state and are left untouched.
+	 * (The OTA write path that produces such images lands with T10/T11.)
+	 *
+	 * These calls touch flash, which disables the flash cache on *both* cores.
+	 * DMX has been parked since init (stopFlag), so dmx_task is idling outside its
+	 * interrupt-disabled critical section and the cross-core cache stop completes
+	 * normally. Wait for the parked ack first so the flash op can never race the
+	 * one-time window where dmx_task is briefly inside the critical section at
+	 * startup before it observes stopFlag. */
+	for (uint_fast8_t i = 0; !dmxStopped && i < 50; i++)
+		vTaskDelay(1);
+	const esp_partition_t *running = esp_ota_get_running_partition();
+	esp_ota_img_states_t ota_state;
+	if (running != NULL &&
+	    esp_ota_get_state_partition(running, &ota_state) == ESP_OK &&
+	    ota_state == ESP_OTA_IMG_PENDING_VERIFY)
+	{
+		esp_ota_mark_app_valid_cancel_rollback();
+		ESP_LOGI(TAG, "OTA image confirmed valid (rollback cancelled)");
+	}
+
+	/* Boot fully succeeded — go live: this is the only place DMX output and
+	 * Art-Net input are enabled (everything above ran with them parked). */
+	startDMX();
+	ESP_LOGI(TAG, "boot complete, DMX output enabled");
 }

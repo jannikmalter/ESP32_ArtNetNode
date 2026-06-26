@@ -8,6 +8,9 @@ sdkconfig
 sdkconfig.*
 !sdkconfig.defaults
 
+# --- Generated web assets (built from src/index.html by gen_web_assets.py) ---
+src/web_assets.h
+
 # --- Build logs & status artifacts ---
 *.log
 *.exit
