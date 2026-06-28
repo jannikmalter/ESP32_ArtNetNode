@@ -29,3 +29,13 @@ CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y
 # clock source. Board-independent; does not affect the cycle-counted DMX core.
 CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=y
 CONFIG_FREERTOS_RUN_TIME_STATS_USING_ESP_TIMER=y
+
+# Link-local (RFC 3927) fallback when no DHCP server answers (R15) — lets the node
+# work on a router-less segment (e.g. a direct PC connection). Enabling AUTOIP turns
+# on lwIP's cooperative DHCP+AUTOIP mode: the DHCP client keeps running, and after
+# CONFIG_LWIP_AUTOIP_TRIES failed DISCOVERs the node self-assigns a 169.254.x.x
+# address; if a DHCP server later appears it takes over automatically (AUTOIP is
+# dropped). Board-independent. NOTE: sdkconfig.defaults only seeds a fresh config,
+# so existing sdkconfig.<env> files must be deleted to re-seed (or set this via
+# menuconfig) to pick it up.
+CONFIG_LWIP_AUTOIP=y

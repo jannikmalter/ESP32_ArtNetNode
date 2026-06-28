@@ -91,7 +91,7 @@ input[type=file]{padding:7px 8px;font-size:13px}
     <div class="row">
       <div>
         <label>Mode</label>
-        <select id="sync" onchange="this.classList.add('edit')"><option value="0">Free-run</option><option value="1">Sync</option></select>
+        <select id="sync" onchange="this.classList.add('edit')"><option value="0">Free-run</option><option value="1">Uni-Sync</option><option value="2">ArtSync</option></select>
       </div>
       <div><label>Sync universe</label><input id="sync_addr" type="number" min="0" inputmode="numeric" onfocus="this.select()" oninput="this.classList.add('edit')"></div>
       <div><label>Channels</label><input id="num_chan" type="number" min="1" max="512" inputmode="numeric" onfocus="this.select()" oninput="this.classList.add('edit')"></div>
@@ -123,10 +123,9 @@ input[type=file]{padding:7px 8px;font-size:13px}
 </div>
 
 <dialog id="namedlg">
-  <label>Short name (tab / Art-Net ShortName)</label>
-  <input id="i_sname" maxlength="17" onfocus="this.select()">
-  <label>Long name (header / Art-Net LongName)</label>
-  <input id="i_lname" maxlength="63" onfocus="this.select()">
+  <label>Name suffix</label>
+  <input id="i_suffix" maxlength="14" oninput="nprev()" onfocus="this.select()">
+  <div class="foot" id="nprev" style="margin-top:10px;line-height:1.6"></div>
   <div class="btns" style="margin-top:18px">
     <button class="ghost" onclick="namedlg.close()">Cancel</button>
     <button onclick="saveName()">Save</button>
@@ -139,7 +138,10 @@ function grid(){var h="";for(var i=0;i<7;i++)h+='<div><div class="o">'+(i+1)+'</
 function led(ok){$("led").className="led "+(ok?"ok":"bad");}
 /* Client-side history (R28): up to 60 samples (~1 min at the 1 s poll). The ESP
  * stores nothing — the browser accumulates and draws these. */
-var N=60,hPps=[],hRef=[],hLoad=[],curName="",curLname="";
+var N=60,hPps=[],hRef=[],hLoad=[],curSuffix="";
+/* Name prefixes — must match NAME_*_PREFIX in src/main.c. The user edits only the
+ * suffix; short/long/hostname are derived (R30/R34). */
+var PSHORT="LF ",PLONG="LICHTFETISCH ArtNet Node ",PHOST="LF-ArtNetNode-";
 /* graph stroke colors pulled from the same --g-* CSS vars the readouts use, so a
  * sparkline can never drift from its number. */
 var cs=getComputedStyle(document.documentElement),
@@ -171,7 +173,7 @@ function seed(id,v){var el=$(id);if(!el.classList.contains("edit"))el.value=v;}
  * feeds the history graphs and lights the connection LED green. */
 function live(s){
   led(true);
-  curName=s.name;curLname=s.lname;
+  curSuffix=s.suffix;
   document.title=s.name;$("title").textContent=s.lname;
   for(var i=0;i<7;i++)seed("p"+i,s.patch[i]);
   seed("sync",s.sync);seed("sync_addr",s.sync_addr);seed("num_chan",s.num_chan);
@@ -195,11 +197,19 @@ function fill(s){
 /* reset(): discard all unsaved edits and reseed from a fresh device poll. */
 function reset(){$("msg").textContent="";poll().then(fill)
   .catch(function(){$("msg").textContent="offline";led(false)});}
-/* name dialog: seed from the last poll, then POST sname/lname (URL-encoded so
+/* hostname preview: mirror the firmware's DNS sanitization (non-alnum -> '-', no
+ * trailing '-'). Kept in sync with apply_node_names() in src/main.c. */
+function hostOf(suf){var h=PHOST+suf.replace(/[^A-Za-z0-9]/g,"-");return h.replace(/-+$/,"");}
+/* nprev(): live read-only preview of the three derived names as the user types.
+ * esc() neutralizes </& so a typed suffix can't inject markup into the preview. */
+function esc(t){return t.replace(/&/g,"&amp;").replace(/</g,"&lt;");}
+function nprev(){var s=$("i_suffix").value;
+  $("nprev").innerHTML=esc("Short: "+PSHORT+s)+"<br>"+esc("Long: "+PLONG+s)+"<br>"+esc("Host: "+hostOf(s));}
+/* name dialog: seed the suffix from the last poll, then POST it (URL-encoded so
  * spaces/punctuation survive) through the shared /api/config save path. */
-function openName(){$("i_sname").value=curName;$("i_lname").value=curLname;$("namedlg").showModal();}
+function openName(){$("i_suffix").value=curSuffix;nprev();$("namedlg").showModal();}
 function saveName(){
-  var q="sname="+encodeURIComponent($("i_sname").value)+"&lname="+encodeURIComponent($("i_lname").value);
+  var q="suffix="+encodeURIComponent($("i_suffix").value);
   fetch("/api/config?"+q,{method:"POST"}).then(function(r){return r.json()})
     .then(function(s){fill(s);$("namedlg").close();}).catch(function(){$("namedlg").close()});
 }

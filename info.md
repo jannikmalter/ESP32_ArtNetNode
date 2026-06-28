@@ -15,8 +15,8 @@ hardware actually built so far) and WT32-ETH01.**
 - Receives Art-Net DMX data over **UDP via wired Ethernet**.
 - Generates **DMX512 output on seven GPIO pins** via software bit-banging.
 - Configurable at runtime over a **web UI** (the former raw TCP CLI was removed)
-  and natively over **Art-Net** (ArtAddress sets the per-output universe patch and
-  node name; ArtPollReply reports them — R22).
+  and natively over **Art-Net** (ArtAddress sets the per-output universe patch;
+  ArtPollReply reports it — R22). The node name is a web-UI-only suffix (R30).
 - Responds to **ArtPoll** discovery so it appears in lighting controllers,
   advertising each output as its own bound port with an independent universe.
 - Persists configuration to **NVS** (non-volatile storage).
@@ -90,10 +90,27 @@ This is the heart of the project. See [src/main.c:170](src/main.c#L170). How it 
   Lowering `num_chan` (channels per output, 1–512) shortens the frame ⇒ **higher
   refresh rate**. `refresh_rate` (Hz) is measured from the cycle delta between
   frames.
-- **Sync vs. free-run**: if `synchronize`, the generator stalls the break until
-  `trigger` is set (the `eth_task` sets `trigger` when an ArtDMX frame for
-  `sync_addr` arrives), with a ~50M-cycle (~0.2 s) failsafe timeout so it never
-  hangs. If not synced, it free-runs.
+- **Three sync modes (R33)**: `synchronize` selects one of `SYNC_OFF` (free-run),
+  `SYNC_UNI` (universe-sync) or `SYNC_ART` (ArtSync). `trigger` is the shared "new
+  data" commit flag (R24). `eth_task` sets it on the **one** signal that belongs to
+  the active mode: a `sync_addr` ArtDMX in `SYNC_UNI`, an ArtSync (`OP_SYNC`,
+  `0x5200`) packet in `SYNC_ART`. Free-run ignores both. The modes never overlap, so
+  there is no `sync_addr`-vs-ArtSync interference. (Persisted as `SYNC_STATE`; values
+  0/1 keep their old meaning so existing nodes are unaffected, 2 is ArtSync; value
+  clamped to 0..2 on load and on `/api/config`.)
+- **Clear-before-send (R24)**: in any sync mode `dmx_task` waits for `trigger` at the
+  frame wrap and **clears it at frame start, before sending** (`trigger=0;
+  curbit=0;`) — so a packet arriving mid-frame re-sets the flag and is reflected in
+  the *next* frame rather than being lost (the old clear-after-send dropped it). A
+  ~50M-cycle (~0.2 s) failsafe timeout means it never hangs if sync data stops. The
+  flag was kept named `trigger`, not renamed.
+- **Frame-perfect snapshot (R32)**: in **both** sync modes ArtDMX writes the
+  `ArtSyncBuf` back buffer, not the live `DMXbuf`. On commit (at the wrap, when
+  `trigger` is consumed) `dmx_task` does `memcpy(DMXbuf, ArtSyncBuf, NUM_OUT*512)` —
+  between frames, in the generating thread, so the live buffer is never mutated
+  mid-frame and a frame can't tear. `Cold` is re-read after the copy so its ~7 µs
+  doesn't shorten the next BREAK. Free-run skips the copy entirely (writes `DMXbuf`
+  directly; path unchanged).
 - **Safe reconfiguration**: `stopDMX()` sets `stopFlag` (generator exits the
   critical section and idles) → write NVS / change buffers → `startDMX()` clears
   it. `eth_task` also pauses on `stopFlag`.
@@ -114,10 +131,20 @@ This is the heart of the project. See [src/main.c:170](src/main.c#L170). How it 
   Set via the `PATCH` command, saved to NVS.
 - `DMX_repatch[NUM_OUT]` — built by `update_dmx_ptr()`: if several outputs are
   patched to the *same* universe, they share one 512-byte buffer slot (dedup), so
-  the same universe can fan out to multiple physical outputs.
-- `DMXbuf` = `calloc(NUM_OUT * 512)` — one 512-channel block per output slot.
-  `eth_task` does `memcpy(DMXbuf + bufaddress*512, ArtNetBuf+18, DMXlength)` on
-  each matching ArtDMX packet.
+  the same universe can fan out to multiple physical outputs. `update_dmx_ptr()`
+  also zeroes both buffers, so it runs **inside** `save_dmx_patch`'s `stopDMX()`
+  window (between the NVS write and `startDMX()`), with `dmx_task` parked — the
+  re-patch can't tear a frame (T6/B5). It runs even if the NVS write fails, so the
+  in-memory patch always takes effect. At boot it runs standalone (DMX already
+  parked) after `load_dmx_patch()`.
+- `DMXbuf` = `calloc(NUM_OUT * 512)` — the live output buffer, one 512-channel block
+  per output slot, read incrementally by `dmx_task`. In **free-run** `eth_task` does
+  `memcpy(DMXbuf + bufaddress*512, ArtNetBuf+18, DMXlength)` straight into it on each
+  matching ArtDMX packet.
+- `ArtSyncBuf` = `calloc(NUM_OUT * 512)` — the **sync-mode back buffer (R32)**. When
+  `synchronize`, `eth_task` writes ArtDMX into `ArtSyncBuf` instead, and `dmx_task`
+  copies the whole thing into `DMXbuf` at the frame boundary on commit (see Sync vs.
+  free-run). Both are zeroed on repatch (`update_dmx_ptr`).
 
 ## Supported boards (compile-time switch)
 
@@ -217,6 +244,29 @@ examples are **6.0.1**. The Ethernet APIs used here (nested `smi_gpio`, 2-arg MA
 ctor, generic PHY) exist in both, so the example is a valid guide. If actually
 bumping to IDF 6.0, verify PlatformIO's `espressif32` platform ships an IDF-6.0
 package first — the toolchain bump, not the Ethernet code, is the risk.
+
+### IP addressing: DHCP with link-local fallback (R15)
+
+`ESP_NETIF_DEFAULT_ETH` starts a DHCP client (R14). `CONFIG_LWIP_AUTOIP=y` (in
+[sdkconfig.defaults](sdkconfig.defaults)) adds an **RFC 3927 link-local fallback** so
+the node still works on a router-less segment — e.g. plugged straight into a PC, where
+both ends self-assign in `169.254.0.0/16` and can talk on one L2 hop. Enabling AUTOIP
+puts lwIP in **cooperative mode** (`LWIP_DHCP_AUTOIP_COOP`): the DHCP client keeps
+DISCOVERing the whole time; only after `CONFIG_LWIP_AUTOIP_TRIES` (2) failed attempts
+does lwIP self-assign a `169.254.x.x` address, and if a DHCP server later appears lwIP
+**drops the link-local address and binds the lease automatically** — no app logic.
+
+So the address can **change at runtime** (link-local → DHCP). `got_ip_event_handler`
+is registered for both `IP_EVENT_ETH_GOT_IP` and `IP_EVENT_ETH_LOST_IP`: GOT_IP stores
+the new address in `device_ip` (used for ArtPollReply), LOST_IP zeroes it so a stale
+address isn't advertised during the transition. The one rule: **never stop the DHCP
+client**, or the cooperative hand-back to DHCP can't happen.
+
+**Discovery is unaffected and needs no extra mechanism.** ArtPoll is a UDP broadcast on
+6454; on a single segment (the link-local case) it reaches the node, which unicasts
+ArtPollReply back — so an Art-Net controller on the same link finds the node regardless
+of subnet (R18). Browser-by-name discovery (mDNS/`.local`) was considered and left **out
+of scope** — find the web UI via the link-local IP the controller/serial reports.
 
 ## Build / flash / monitor
 
@@ -365,33 +415,44 @@ OTA upload endpoint (**R26**). The raw TCP CLI it replaced was **removed**
 | Route | Method | Effect |
 |---|---|---|
 | `/` | GET | serves the embedded config page (`index_html`) |
-| `/api/state` | GET | flat JSON: fw/board/variant, `name` (short), `lname` (long), `patch[7]`, `sync`, `sync_addr`, `num_chan`, live `refresh`, live `pps`, live `load0` |
-| `/api/config` | POST | query params `patch=a,b,…,g` · `sync=0\|1` · `sync_addr=n` · `num_chan=n` · `sname=…` · `lname=…` (any subset); applies + returns fresh state |
+| `/api/state` | GET | flat JSON: fw/board/variant, `suffix` (editable name part), derived `name` (short), `lname` (long), `host` (hostname), `patch[7]`, `sync`, `sync_addr`, `num_chan`, live `refresh`, live `pps`, live `load0` |
+| `/api/config` | POST | query params `patch=a,b,…,g` · `sync=0\|1\|2` (free-run/uni-sync/ArtSync, R33) · `sync_addr=n` · `num_chan=n` · `suffix=…` (any subset); applies + returns fresh state |
 | `/api/ota` | POST | raw firmware image (octet-stream body) → inactive OTA slot → reboot; see [Firmware update (OTA)](#firmware-update-ota) |
 
 `/api/config` accepts the same DMX settings the old TCP CLI did — `patch` (per-output
-universe), `sync`, `sync_addr`, `num_chan` — plus the node names `sname`/`lname`
+universe), `sync`, `sync_addr`, `num_chan` — plus the node-name `suffix`
 (**R30**), and applies them through the `save_dmx_patch()` / `save_sync_state()` /
 `save_node_name()` paths, inheriting the `stopDMX()` → NVS → `startDMX()` handshake
-so it never mutates live DMX state. The names arrive percent-encoded and are
+so it never mutates live DMX state. The suffix arrives percent-encoded and is
 `url_decode()`d in place (httpd does not decode query values), then `strncpy`-capped
-to the same 17/63 lengths as the ArtAddress path.
+to `SUFFIX_MAXLEN` (14); `save_node_name()` re-derives the short/long/host names.
 
 **Web-input hardening (R31).** No value entered through the web UI can break the
-node. `/api/state` runs both names through `json_escape()` (escapes `"`, `\`, and
-control bytes as `\uXXXX`) so a name set to arbitrary bytes — over Art-Net or the
-web form — can never produce malformed JSON; the response buffers are sized for
-worst-case 6×-expanded names. Over-long query strings or values are rejected
-outright (the httpd helpers return `TRUNC`, not `OK`, and every parse acts only on
-`OK`), names are length-capped, `num_chan` is clamped 1..512, and `patch`/`sync_addr`
-are stored as labels that are compared — never used as buffer indices. This is the
+node. `/api/state` runs the suffix and the derived names through `json_escape()`
+(escapes `"`, `\`, and control bytes as `\uXXXX`) so a name set to arbitrary bytes
+can never produce malformed JSON; the response buffers are sized for worst-case
+6×-expanded names. Over-long query strings or values are rejected outright (the
+httpd helpers return `TRUNC`, not `OK`, and every parse acts only on `OK`), the
+suffix is length-capped, `num_chan` is clamped 1..512, and `patch`/`sync_addr` are
+stored as labels that are compared — never used as buffer indices. This is the
 web/HTTP counterpart of R21's Art-Net bounds-checking.
 
 ### Names, live state & UI behavior (R27 / R30)
 
-The page header shows the **long name** and the browser tab title shows the **short
-name**, both refreshed every poll; a pencil icon opens a small dialog to edit them.
-The output row is a single editable line per output that the poll keeps live, except
+**Suffix-only naming (R30).** The node's three identities — Art-Net ShortName,
+Art-Net LongName, and network hostname (R34) — are all derived from a single
+user-editable **suffix** (e.g. `Rack`) by fixed prefixes (`NAME_*_PREFIX` in
+`main.c`, mirrored as `P*` constants in `index.html`): short `"LF "+suffix`, long
+`"LICHTFETISCH ArtNet Node "+suffix`, host `"LF-ArtNetNode-"+suffix`. The suffix is
+capped at 14 so `"LF "+suffix` fits the 17-char ShortName; the long name and
+hostname have ample room. `apply_node_names()` rebuilds all three from the suffix
+(and re-applies the hostname) on load and on every change. The default suffix is the
+build `VARIANT_NAME` (so a `mini` build still announces its variant — B12).
+
+The page header shows the derived **long name** and the browser tab title shows the
+derived **short name**, both refreshed every poll; a pencil icon opens a small dialog
+to edit the **suffix**, with a live read-only preview of the resulting short/long/host
+names. The output row is a single editable line per output that the poll keeps live, except
 that any field the user changes is flagged with a red border (`.edit`) and frozen
 from further poll overwrites until **Save** (commit) or **Reset** (discard, reseed
 from the device) — the same dirty model applies to Mode/Sync/Channels. A
@@ -471,8 +532,10 @@ fully independent universe — every output can have any universe.
   (`idx = bind<=1 ? 0 : bind-1`). The new universe is rebuilt from the current one,
   replacing only the Net/Sub/Sw sub-fields whose source byte has **bit7 set** (spec:
   "ignored unless bit 7 is high"), so a partial program never zeroes a universe.
-  PortName (offset 14) / LongName (offset 32) are applied if their first byte is
-  non-null. Changes persist (`save_dmx_patch` + `update_dmx_ptr`, `save_node_name`),
+  `handle_artaddress()` is **patch-only**: the PortName/LongName fields in the packet
+  are ignored, because the node identity is a web-UI-only suffix (R30) — a controller
+  can no longer override it. Changes persist via `save_dmx_patch` (which also
+  rebuilds the repatch table via `update_dmx_ptr` inside its stop window, T6),
   then the node replies with ArtPollReply. **Any Art-Net patch change also resets
   sync mode and `num_chan` to defaults** (free-run, 512 channels) — those can't be
   set over Art-Net, so resetting them keeps an Art-Net-only configured node from
@@ -488,13 +551,16 @@ fully independent universe — every output can have any universe.
 - DMX timing: `BREAK` 30, `MAB` 10 bit-times; 11 bit-times/channel; 960 cycles/bit.
 - Art-Net opcodes (little-endian on the wire — note byte-swapped reads like
   `(buf[9]<<8)|buf[8]`; `#define`d as `OP_*` in [src/main.c](src/main.c)): ArtDMX
-  `0x5000`; ArtPoll `0x2000` → ArtPollReply `0x2100`; ArtAddress `0x6000`
-  (remote config, R22); ArtInput `0x7000` (unhandled — output-only node). ArtDMX
+  `0x5000`; ArtSync `0x5200` (sets the sync `trigger` flag, R24); ArtPoll `0x2000`
+  → ArtPollReply `0x2100`; ArtAddress `0x6000` (remote config, R22); ArtInput
+  `0x7000` (unhandled — output-only node). ArtDMX
   payload: length at bytes 16–17, data from byte 18; universe (port-address) at
   bytes 14–15. (The pre-R22 firmware mis-used `0x6000`/`0x7000` as extra ArtPoll
   triggers; that quirk is gone.)
 - NVS namespace `"storage"`. Keys: `DMXPATCH` (blob), `SYNC_STATE` (u8),
-  `SYNC_ADDR` (u16), `NUM_CHAN` (u16), `SHORTNAME` (str), `LONGNAME` (str).
+  `SYNC_ADDR` (u16), `NUM_CHAN` (u16), `SUFFIX` (str — the node-name suffix, R30).
+  (The old `SHORTNAME`/`LONGNAME` keys are no longer read; an upgraded node reverts
+  to the default `VARIANT_NAME` suffix until re-set.)
 
 ## Toolchain facts
 
@@ -510,11 +576,15 @@ fully independent universe — every output can have any universe.
   `"ArtNetNode"` in `src/main.c`). Match surrounding style.
 - **Endianness:** Art-Net is little-endian; the manual byte assembly is
   intentional — keep it consistent.
-- **Node name:** `node_short_name`/`node_long_name` seed from `VARIANT_NAME`
-  (so a `mini` build no longer announces "Rack" — B12 fixed), are loaded from NVS
-  (`SHORTNAME`/`LONGNAME`), reported in ArtPollReply + `/api/state` (JSON-escaped,
-  R31), and settable both over Art-Net via ArtAddress (R22) and through the web UI
-  `/api/config` `sname`/`lname` params (R30) — both routes share `save_node_name()`.
+- **Node name (R30/R34):** a single editable `node_suffix` (NVS key `SUFFIX`, seeded
+  from `VARIANT_NAME` so a `mini` build announces its variant — B12) drives all three
+  identities. `apply_node_names()` derives `node_short_name` (`"LF "`+suffix),
+  `node_long_name` (`"LICHTFETISCH ArtNet Node "`+suffix) and `node_hostname`
+  (`"LF-ArtNetNode-"`+sanitized suffix), and applies the hostname via
+  `esp_netif_set_hostname()`. Short/long are reported in ArtPollReply + `/api/state`
+  (JSON-escaped, R31). The suffix is set **only** via the web UI `/api/config`
+  `suffix` param (R30); ArtAddress no longer writes names. `save_node_name()`
+  persists the suffix and re-derives the rest.
 - **`xthal_get_ccount()`** in `dmx_task` is the original's cycle counter; it still
   resolves on IDF v5 via the Xtensa FreeRTOS port. If a build ever can't find it,
   swap to `esp_cpu_get_cycle_count()` (`esp_cpu.h`) — same value.

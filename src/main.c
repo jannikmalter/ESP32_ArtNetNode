@@ -12,7 +12,7 @@
  * platformio.ini — see the BUILD CONFIGURATION block below.
  */
 
-#define FIRMWARE_VERSION "2.1"
+#define FIRMWARE_VERSION "2.2"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -134,12 +134,14 @@
 #define OP_POLL      0x2000   /* ArtPoll      -> we reply with ArtPollReply       */
 #define OP_POLLREPLY 0x2100   /* ArtPollReply -> our reply opcode                 */
 #define OP_DMX       0x5000   /* ArtDmx       -> DMX data for one universe        */
+#define OP_SYNC      0x5200   /* ArtSync      -> output buffered frames now (R24)  */
 #define OP_ADDRESS   0x6000   /* ArtAddress   -> remote config (patch/name) (R22) */
 #define OP_INPUT     0x7000   /* ArtInput     -> input enable/disable (unhandled) */
 
 static const char *TAG = "ArtNetNode";
 
-uint8_t *DMXbuf;
+uint8_t *DMXbuf;       /* live output buffer, read incrementally by dmx_task       */
+uint8_t *ArtSyncBuf;   /* sync-mode back buffer; committed to DMXbuf at frame edge  */
 
 uint_fast16_t DMX_patch[NUM_OUT] = {0, 0, 0, 0, 0, 0, 0};
 uint_fast8_t DMX_repatch[NUM_OUT] = {0, 0, 0, 0, 0, 0, 0};
@@ -161,17 +163,70 @@ uint_fast8_t DMX_repatch[NUM_OUT] = {0, 0, 0, 0, 0, 0, 0};
 volatile uint_fast8_t stopFlag = 1;
 volatile uint_fast8_t dmxStopped = 0;
 
-uint_fast8_t synchronize = 0;
+/* DMX sync mode (R33). Three modes, persisted in NVS as SYNC_STATE (0/1 keep their
+ * old meaning, so existing nodes are unaffected):
+ *   SYNC_OFF - free-run: ArtDMX writes DMXbuf directly, generator never waits.
+ *   SYNC_UNI - universe-sync: ArtDMX writes the back buffer; commit on the
+ *              sync_addr universe's ArtDMX.
+ *   SYNC_ART - ArtSync: ArtDMX writes the back buffer; commit on ArtSync (0x5200).
+ * Both sync modes snapshot ArtSyncBuf -> DMXbuf at the frame edge (R32). */
+#define SYNC_OFF 0
+#define SYNC_UNI 1
+#define SYNC_ART 2
+uint_fast8_t synchronize = SYNC_OFF;
 uint_fast16_t sync_addr = 0;
 uint_fast16_t num_chan = 0;
 volatile uint_fast8_t trigger = 0;
 
-/* Node identity reported in ArtPollReply and settable over Art-Net via ArtAddress
- * (R22). Seeded from the build VARIANT_NAME so a "mini" build no longer announces
- * "Rack" (B12); overridden by NVS (keys SHORTNAME/LONGNAME) and by ArtAddress.
- * ShortName max 17 chars + null, LongName max 63 + null (Art-Net field sizes). */
-char node_short_name[18] = "LF " VARIANT_NAME;
-char node_long_name[64]  = "LICHTFETISCH ArtNet " VARIANT_NAME;
+/* Node identity (R30). The user edits ONE suffix (e.g. "Rack"); the short name,
+ * long name and hostname are all derived from it by fixed prefixes, so the three
+ * identities stay consistent by construction. The suffix seeds from the build
+ * VARIANT_NAME so a "mini" build no longer announces "Rack" (B12); it is overridden
+ * by NVS (key SUFFIX). Suffix capped at 14 so "LF "+suffix fits the 17-char Art-Net
+ * ShortName field; the long name (63) and hostname (DNS) have ample room. The
+ * derived buffers below are filled by apply_node_names(). */
+#define NAME_SHORT_PREFIX "LF "
+#define NAME_LONG_PREFIX  "LICHTFETISCH ArtNet Node "
+#define NAME_HOST_PREFIX  "LF-ArtNetNode-"
+#define SUFFIX_MAXLEN     14   /* 17 (ShortName) - strlen("LF ") */
+
+char node_suffix[SUFFIX_MAXLEN + 1] = VARIANT_NAME;
+char node_short_name[18];   /* "LF "+suffix             — Art-Net ShortName (17+nul) */
+char node_long_name[64];    /* long-prefix+suffix       — Art-Net LongName  (63+nul) */
+char node_hostname[64];     /* "LF-ArtNetNode-"+suffix  — DNS hostname (R34)         */
+
+/* Ethernet netif handle, kept here so save_node_name() can re-apply the hostname
+ * when the suffix changes (set once in app_main). */
+esp_netif_t *eth_netif = NULL;
+
+/* Derive the three names from node_suffix (R30/R34). Short/long are plain
+ * concatenation. The hostname must be a valid DNS label ([A-Za-z0-9-], no trailing
+ * '-'), so every non-alphanumeric suffix byte is mapped to '-' and a trailing '-'
+ * is trimmed (an empty suffix yields "LF-ArtNetNode"). If the netif is up, the new
+ * hostname is applied (effective on the next DHCP renew/reboot). */
+void apply_node_names(void)
+{
+	snprintf(node_short_name, sizeof(node_short_name), NAME_SHORT_PREFIX "%s", node_suffix);
+	snprintf(node_long_name,  sizeof(node_long_name),  NAME_LONG_PREFIX  "%s", node_suffix);
+
+	size_t n = 0;
+	const char *p = NAME_HOST_PREFIX;
+	while (*p && n < sizeof(node_hostname) - 1)
+		node_hostname[n++] = *p++;
+	for (const char *s = node_suffix; *s && n < sizeof(node_hostname) - 1; s++)
+	{
+		char c = *s;
+		uint_fast8_t ok = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+		                  (c >= '0' && c <= '9');
+		node_hostname[n++] = ok ? c : '-';
+	}
+	while (n > 0 && node_hostname[n - 1] == '-')   /* no trailing hyphen */
+		n--;
+	node_hostname[n] = '\0';
+
+	if (eth_netif != NULL)
+		esp_netif_set_hostname(eth_netif, node_hostname);
+}
 
 float refresh_rate;
 
@@ -187,8 +242,9 @@ volatile uint_fast16_t artnet_pps = 0;
 volatile uint_fast8_t cpu_load0 = 0;
 
 /* Device IPv4 address in network byte order, captured from
- * IP_EVENT_ETH_GOT_IP and used to fill the IP field of ArtPollReply.
- * 0.0.0.0 until DHCP/link assigns one. */
+ * IP_EVENT_ETH_GOT_IP and used to fill the IP field of ArtPollReply. 0.0.0.0 until
+ * DHCP or the AUTOIP link-local fallback (R15) assigns one; with AUTOIP the address
+ * can change at runtime (link-local -> DHCP), so this is updated on every IP event. */
 static volatile uint32_t device_ip = 0;
 
 /** Event handler for Ethernet link events (modern API, board-independent) */
@@ -205,10 +261,21 @@ static void eth_event_handler(void *arg, esp_event_base_t event_base,
 	}
 }
 
-/** Event handler for IP_EVENT_ETH_GOT_IP */
+/** Event handler for IP_EVENT_ETH_GOT_IP / IP_EVENT_ETH_LOST_IP.
+ * With the AUTOIP fallback (R15) the address can change at runtime: a link-local
+ * 169.254.x.x is assigned when DHCP times out, then replaced (LOST_IP, then a fresh
+ * GOT_IP) if a DHCP server later appears. We just track the current address. */
 static void got_ip_event_handler(void *arg, esp_event_base_t event_base,
                                  int32_t event_id, void *event_data)
 {
+	if (event_id == IP_EVENT_ETH_LOST_IP)
+	{
+		/* Don't advertise a stale address while DHCP/AUTOIP re-negotiates. */
+		device_ip = 0;
+		ESP_LOGI(TAG, "Ethernet lost IP");
+		return;
+	}
+
 	ip_event_got_ip_t *event = (ip_event_got_ip_t *) event_data;
 	const esp_netif_ip_info_t *ip_info = &event->ip_info;
 
@@ -333,10 +400,20 @@ void dmx_task()
 
 		if (curbit >= (num_chan + 1) * 11 + BREAK + MAB)  /* 450 */
 		{
-			if ((synchronize == 1) && (trigger == 0) && (xthal_get_ccount() - last_frame < 50000000))
+			if ((synchronize != SYNC_OFF) && (trigger == 0) && (xthal_get_ccount() - last_frame < 50000000))
 				curbit--;
 			else
 			{
+				/* Commit. In sync mode snapshot the back buffer into the live
+				 * buffer here, between frames (line idle), in the same thread
+				 * that reads it - the only place the copy can't tear the frame
+				 * (R32). Re-read Cold afterwards so the copy time doesn't shorten
+				 * the next BREAK. Free-run leaves both untouched. */
+				if (synchronize != SYNC_OFF)
+				{
+					memcpy(DMXbuf, ArtSyncBuf, NUM_OUT * 512);
+					Cold = xthal_get_ccount();
+				}
 				trigger = 0;
 				curbit = 0;
 				new_frame = xthal_get_ccount();
@@ -367,22 +444,29 @@ void stopDMX()
 		vTaskDelay(1);
 }
 
+void update_dmx_ptr();   /* fwd decl: called inside save_dmx_patch's stop window */
+
 void save_dmx_patch()
 {
 	stopDMX();
 
 	nvs_handle my_handle;
 	if (nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle) != ESP_OK)
-	{
 		ESP_LOGE(TAG, "save_dmx_patch: nvs_open failed");
-		startDMX();   /* never leave DMX parked on a failed save */
-		return;
+	else
+	{
+		nvs_set_blob(my_handle, "DMXPATCH", DMX_patch, NUM_OUT * sizeof(uint_fast16_t));
+		nvs_commit(my_handle);
+		nvs_close(my_handle);
 	}
-	nvs_set_blob(my_handle, "DMXPATCH", DMX_patch, NUM_OUT * sizeof(uint_fast16_t));
-	nvs_commit(my_handle);
-	nvs_close(my_handle);
 
-	startDMX();
+	/* Rebuild the dedup repatch table and clear the buffers here, inside the stop
+	 * window, so the re-patch is glitch-free (T6/B5): dmx_task is parked, so it
+	 * can't read DMXbuf/DMX_repatch mid-rebuild and no frame can tear. Runs even
+	 * on NVS failure so the in-memory patch still takes effect. */
+	update_dmx_ptr();
+
+	startDMX();   /* never leave DMX parked, even on a failed save */
 }
 
 void save_sync_state()
@@ -442,34 +526,41 @@ void load_sync_state()
 		nvs_close(my_handle);
 	}
 
-	synchronize = (uint_fast8_t)sync_load;
+	synchronize = (sync_load > SYNC_ART) ? SYNC_OFF : (uint_fast8_t)sync_load;
 	sync_addr = (uint_fast16_t)sync_addr_load;
+	/* Clamp to 1..512 (B11): a stored value out of range (downgrade, corruption)
+	 * would make the frame-length math invalid. Same bounds as the setter. */
+	if (num_chan_load < 1) num_chan_load = 1;
+	if (num_chan_load > 512) num_chan_load = 512;
 	num_chan = (uint_fast16_t)num_chan_load;
 }
 
-/* Node name (R22). Like load_sync_state, nvs_get_str only writes on success, so a
- * fresh device keeps the VARIANT_NAME-seeded defaults. The size args are in/out;
- * pass the full buffer sizes. */
+/* Node name suffix (R30). Like load_sync_state, nvs_get_str only writes on success,
+ * so a fresh device keeps the VARIANT_NAME-seeded default suffix. Derives the
+ * short/long/host names from whatever suffix we end up with. The size arg is
+ * in/out; pass the full buffer size. */
 void load_node_name()
 {
 	nvs_handle my_handle;
-	if (nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle) != ESP_OK)
+	if (nvs_open(STORAGE_NAMESPACE, NVS_READWRITE, &my_handle) == ESP_OK)
 	{
-		ESP_LOGE(TAG, "load_node_name: nvs_open failed, keeping defaults");
-		return;
+		size_t suffix_size = sizeof(node_suffix);
+		nvs_get_str(my_handle, "SUFFIX", node_suffix, &suffix_size);
+		nvs_close(my_handle);
 	}
-	size_t short_size = sizeof(node_short_name);
-	size_t long_size  = sizeof(node_long_name);
-	nvs_get_str(my_handle, "SHORTNAME", node_short_name, &short_size);
-	nvs_get_str(my_handle, "LONGNAME", node_long_name, &long_size);
-	nvs_close(my_handle);
+	else
+		ESP_LOGE(TAG, "load_node_name: nvs_open failed, keeping default suffix");
+	apply_node_names();
 }
 
-/* Persist the node name. Reuses the stopDMX()->NVS->startDMX() handshake so the
- * flash write never races the core-1 critical section (same contract as the patch
- * and sync save paths). */
+/* Persist the node name suffix (R30). The caller updates node_suffix; this
+ * re-derives the short/long/host names and applies the hostname, then persists the
+ * suffix. Reuses the stopDMX()->NVS->startDMX() handshake so the flash write never
+ * races the core-1 critical section (same contract as the patch and sync paths). */
 void save_node_name()
 {
+	apply_node_names();
+
 	stopDMX();
 
 	nvs_handle my_handle;
@@ -479,8 +570,7 @@ void save_node_name()
 		startDMX();   /* never leave DMX parked on a failed save */
 		return;
 	}
-	nvs_set_str(my_handle, "SHORTNAME", node_short_name);
-	nvs_set_str(my_handle, "LONGNAME", node_long_name);
+	nvs_set_str(my_handle, "SUFFIX", node_suffix);
 	nvs_commit(my_handle);
 	nvs_close(my_handle);
 
@@ -490,6 +580,7 @@ void save_node_name()
 void update_dmx_ptr()
 {
 	memset(DMXbuf, 0, NUM_OUT*512);
+	memset(ArtSyncBuf, 0, NUM_OUT*512);
 	for (uint_fast8_t i = 0; i < NUM_OUT; i++)
 	{
 		uint_fast16_t tmp = DMX_patch[i];
@@ -604,40 +695,25 @@ static void handle_artaddress(const char *buf, int recv_len, int s, char *replyB
 	if (patch_changed)
 		DMX_patch[idx] = addr;
 
-	/* PortName (offset 14, 18 bytes) and LongName (offset 32, 64 bytes): the node
-	 * ignores a field whose first byte is null. */
-	uint_fast8_t name_changed = 0;
-	if (buf[14] != '\0')
-	{
-		strncpy(node_short_name, buf + 14, 17);
-		node_short_name[17] = '\0';
-		name_changed = 1;
-	}
-	if (buf[32] != '\0')
-	{
-		strncpy(node_long_name, buf + 32, 63);
-		node_long_name[63] = '\0';
-		name_changed = 1;
-	}
+	/* PortName/LongName in the packet are ignored: the node identity is a web-UI-only
+	 * suffix (R30), derived into the short/long names + hostname, so a controller can
+	 * no longer override it over Art-Net. ArtAddress is patch-only here. */
 
-	/* Persist through the proven handshake. PATCH order: save (stops/starts DMX),
-	 * then rebuild the dedup repatch table (matches /api/config). */
+	/* Persist through the proven handshake. save_dmx_patch() also rebuilds the
+	 * dedup repatch table inside its stop window (T6). */
 	if (patch_changed)
 	{
 		/* Sync mode and channel count cannot be set over Art-Net. Reset them to
 		 * defaults (free-run, full 512-channel frame) on any Art-Net patch change,
 		 * so a node configured solely via Art-Net behaves predictably instead of
 		 * silently keeping stale web-UI values the user can't see here. */
-		synchronize = 0;
+		synchronize = SYNC_OFF;
 		sync_addr = 0;
 		num_chan = 512;
 		save_sync_state();
 
 		save_dmx_patch();
-		update_dmx_ptr();
 	}
-	if (name_changed)
-		save_node_name();
 
 	/* Command byte (offset 106): AcNone / AcLed* / AcCancelMerge etc. are not
 	 * implemented on this output-only node; ignore safely (no error). */
@@ -742,10 +818,24 @@ void eth_task()
 							DMXlength = 512;
 						if (DMXlength > recv_len - 18)
 							DMXlength = recv_len - 18;
-						memcpy(DMXbuf + bufaddress * 512, ArtNetBuf + 18, DMXlength);
-						if (synchronize == 1 && portaddress == sync_addr)
+						/* Free-run writes the live buffer directly. In sync mode
+						 * writes go to the back buffer; dmx_task copies it whole
+						 * into DMXbuf at the frame boundary on commit (R32), so a
+						 * frame is never torn mid-output. */
+						uint8_t *dst = (synchronize != SYNC_OFF) ? ArtSyncBuf : DMXbuf;
+						memcpy(dst + bufaddress * 512, ArtNetBuf + 18, DMXlength);
+						if (synchronize == SYNC_UNI && portaddress == sync_addr)
 							trigger = 1;
 					}
+				}
+				else if (opcode == OP_SYNC && recv_len >= 12)
+				{
+					/* ArtSync: controller's "output buffered frames now" pulse.
+					 * Commits the back buffer only in ArtSync mode (R33); ignored
+					 * in free-run and universe-sync, where it is not the trigger.
+					 * Min ArtSync = 14 bytes; the opcode read already needs >=10. */
+					if (synchronize == SYNC_ART)
+						trigger = 1;
 				}
 				else if (opcode == OP_POLL)
 				{
@@ -867,11 +957,13 @@ static void json_escape(const char *src, char *dst, int dstlen)
 /* Flat JSON snapshot of all settings + live refresh rate (read by index.html). */
 static int build_state_json(char *buf, int len)
 {
-	char sname[128], lname[400];   /* escaped: up to 6x the 17/63-byte names */
+	char sname[128], lname[400], suf[96];   /* escaped: up to 6x the source bytes */
 	json_escape(node_short_name, sname, sizeof(sname));
 	json_escape(node_long_name, lname, sizeof(lname));
-	int n = snprintf(buf, len, "{\"fw\":\"%s\",\"board\":\"%s\",\"variant\":\"%s\",\"name\":\"%s\",\"lname\":\"%s\",\"patch\":[",
-	                 FIRMWARE_VERSION, BOARD_NAME, VARIANT_NAME, sname, lname);
+	json_escape(node_suffix, suf, sizeof(suf));
+	/* hostname is sanitized to [A-Za-z0-9-] so it needs no JSON escaping. */
+	int n = snprintf(buf, len, "{\"fw\":\"%s\",\"board\":\"%s\",\"variant\":\"%s\",\"suffix\":\"%s\",\"name\":\"%s\",\"lname\":\"%s\",\"host\":\"%s\",\"patch\":[",
+	                 FIRMWARE_VERSION, BOARD_NAME, VARIANT_NAME, suf, sname, lname, node_hostname);
 	for (uint_fast8_t i = 0; i < NUM_OUT; i++)
 		n += snprintf(buf + n, len - n, "%s%u", i ? "," : "", (unsigned)DMX_patch[i]);
 	n += snprintf(buf + n, len - n,
@@ -889,7 +981,7 @@ static esp_err_t root_get_handler(httpd_req_t *req)
 
 static esp_err_t state_get_handler(httpd_req_t *req)
 {
-	char buf[640];
+	char buf[768];
 	int n = build_state_json(buf, sizeof(buf));
 	httpd_resp_set_type(req, "application/json");
 	return httpd_resp_send(req, buf, n);
@@ -915,7 +1007,7 @@ static void url_decode(char *s)
 	*d = '\0';
 }
 
-/* POST /api/config?patch=a,b,c,d,e,f,g&sync=0|1&sync_addr=n&num_chan=n&sname=..&lname=..
+/* POST /api/config?patch=a,b,c,d,e,f,g&sync=0|1&sync_addr=n&num_chan=n&suffix=..
  * Any subset of keys may be present; applies each via the shared save path, then
  * returns the fresh state JSON. */
 static esp_err_t config_post_handler(httpd_req_t *req)
@@ -937,7 +1029,8 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 		}
 		if (httpd_query_key_value(query, "sync", val, sizeof(val)) == ESP_OK)
 		{
-			synchronize = (atoi(val) != 0);
+			int sv = atoi(val);                       /* 0=off 1=uni 2=artsync */
+			synchronize = (sv < SYNC_OFF || sv > SYNC_ART) ? SYNC_OFF : (uint_fast8_t)sv;
 			save_sync = 1;
 		}
 		if (httpd_query_key_value(query, "sync_addr", val, sizeof(val)) == ESP_OK)
@@ -953,36 +1046,27 @@ static esp_err_t config_post_handler(httpd_req_t *req)
 			num_chan = n;
 			save_sync = 1;
 		}
-		/* Node identity (same length caps as the ArtAddress path: 17 / 63). */
-		if (httpd_query_key_value(query, "sname", val, sizeof(val)) == ESP_OK)
+		/* Node identity: a single suffix (R30), capped at SUFFIX_MAXLEN so "LF "+suffix
+		 * fits the Art-Net ShortName. save_node_name() re-derives short/long/host. */
+		if (httpd_query_key_value(query, "suffix", val, sizeof(val)) == ESP_OK)
 		{
 			url_decode(val);
-			strncpy(node_short_name, val, 17);
-			node_short_name[17] = '\0';
-			save_name = 1;
-		}
-		if (httpd_query_key_value(query, "lname", val, sizeof(val)) == ESP_OK)
-		{
-			url_decode(val);
-			strncpy(node_long_name, val, 63);
-			node_long_name[63] = '\0';
+			strncpy(node_suffix, val, SUFFIX_MAXLEN);
+			node_suffix[SUFFIX_MAXLEN] = '\0';
 			save_name = 1;
 		}
 	}
 
-	/* Reuse the proven stop/start + NVS handshake. PATCH order matters:
-	 * save (which stops/starts DMX), then rebuild the dedup repatch table. */
+	/* Reuse the proven stop/start + NVS handshake. save_dmx_patch() also rebuilds
+	 * the dedup repatch table inside its stop window (T6). */
 	if (save_patch)
-	{
 		save_dmx_patch();
-		update_dmx_ptr();
-	}
 	if (save_sync)
 		save_sync_state();
 	if (save_name)
 		save_node_name();
 
-	char buf[640];
+	char buf[768];
 	int n = build_state_json(buf, sizeof(buf));
 	httpd_resp_set_type(req, "application/json");
 	return httpd_resp_send(req, buf, n);
@@ -1091,9 +1175,10 @@ void app_main(void)
 	ESP_ERROR_CHECK(esp_netif_init());
 	ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-	/* --- Ethernet netif --- */
+	/* --- Ethernet netif --- (stored in the file-scope eth_netif so the hostname can
+	 * be re-applied when the suffix changes, R34) */
 	esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
-	esp_netif_t *eth_netif = esp_netif_new(&netif_cfg);
+	eth_netif = esp_netif_new(&netif_cfg);
 	if (eth_netif == NULL)
 	{
 		ESP_LOGE(TAG, "esp_netif_new failed");
@@ -1138,11 +1223,11 @@ void app_main(void)
 	                                           &eth_event_handler, NULL));
 	ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_GOT_IP,
 	                                           &got_ip_event_handler, NULL));
+	ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_ETH_LOST_IP,
+	                                           &got_ip_event_handler, NULL));
 
-	/* Start Ethernet state machine */
-	ESP_ERROR_CHECK(esp_eth_start(eth_handle));
-
-	/* --- NVS --- */
+	/* --- NVS --- (before esp_eth_start so the hostname suffix is loaded and the
+	 * derived hostname is set on the netif before the first DHCP request, R34) */
 	esp_err_t err = nvs_flash_init();
 	if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND)
 	{
@@ -1151,9 +1236,17 @@ void app_main(void)
 	}
 	ESP_ERROR_CHECK(err);
 
+	/* Load the name suffix and derive short/long names + apply the hostname now,
+	 * while the netif is attached but not yet started (R30/R34). */
+	load_node_name();
+
+	/* Start Ethernet state machine */
+	ESP_ERROR_CHECK(esp_eth_start(eth_handle));
+
 	/* --- DMX buffer + persisted settings --- */
 	DMXbuf = calloc(NUM_OUT * 512, sizeof(uint8_t));
-	if (DMXbuf == NULL)
+	ArtSyncBuf = calloc(NUM_OUT * 512, sizeof(uint8_t));
+	if (DMXbuf == NULL || ArtSyncBuf == NULL)
 	{
 		ESP_LOGE(TAG, "DMXbuf alloc failed");
 		esp_restart();
@@ -1162,7 +1255,8 @@ void app_main(void)
 	load_dmx_patch();
 	update_dmx_ptr();
 	load_sync_state();
-	load_node_name();
+	/* load_node_name() already ran above (before esp_eth_start) so the hostname is
+	 * set ahead of the first DHCP request (R34). */
 
 	/* --- Tasks: network on core 0, DMX bit-bang alone on core 1 --- */
 	if (xTaskCreatePinnedToCore(eth_task, "eth_task", 2048, NULL, (tskIDLE_PRIORITY + 2), NULL, 0) != pdPASS ||

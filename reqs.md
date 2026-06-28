@@ -1,6 +1,6 @@
 # ESP32 ArtNetNode — Requirements
 
-Status: Active · Updated: 2026-06-26
+Status: Active · Updated: 2026-06-28
 
 Single source of truth for the firmware ([src/main.c](src/main.c)). Consolidates
 the former `requirements.md` and `bugs.md`. Covers goals, functional requirements
@@ -50,8 +50,10 @@ One row each. Use "shall". `Type`: F=function, Q=quality, C=constraint.
 | R10 | C | Watchdog and scheduler shall be held off on the DMX core | M | G2 | ☑ | `vPortEnterCritical` + INT/TASK WDT on CPU1 disabled |
 | R11 | Q | DMX shall run at 250 kbaud with timing by CPU cycle counting | M | G2 | ☑ | 960 cycles/bit at 240 MHz |
 | R12 | F | The node shall support an adjustable channel count to raise frame rate | S | G2 | ☑ | `NUM_CHAN` 1..512 |
-| R13 | F | The node shall sync DMX to a selected input universe, or free-run | S | G2 | ☑ | `synchronize` / `sync_addr` / `trigger`; sync reliability reworked in R24 |
-| R24 | F | The node shall rework DMX sync into a "new data" flag with clear-before-send semantics, so a packet arriving mid-frame is not lost | M | G2 | ☐ | reworks R13; see [reqs/R24.md](reqs/R24.md), T9 |
+| R13 | F | The node shall sync DMX to a selected input universe, or free-run | S | G2 | ☑ | `synchronize` / `sync_addr` / `trigger`; sync reliability reworked in R24; ArtSync added as a third mode in R33 |
+| R24 | F | The node shall rework DMX sync into a "new data" flag with clear-before-send semantics, so a packet arriving mid-frame is not lost | M | G2 | ☑ | reworks R13; `trigger` (name kept) set on sync ArtDMX + ArtSync `0x5200`, cleared at frame start; clear-before-send verified on hardware; see [reqs/R24.md](reqs/R24.md), T9 |
+| R32 | F | In a sync mode the node shall double-buffer DMX so each output frame is a consistent snapshot (no mid-frame tearing) | S | G2 | ☑ | `ArtSyncBuf` back buffer; sync-mode ArtDMX writes the back buffer, `dmx_task` copies it to `DMXbuf` at the frame boundary on commit; see [reqs/R32.md](reqs/R32.md), T17 |
+| R33 | F | The node shall offer three selectable DMX sync modes: free-run, universe-sync, and ArtSync, each committing on exactly one signal | S | G2 | ☑ | `synchronize` ∈ {`SYNC_OFF`,`SYNC_UNI`,`SYNC_ART`}; uni commits on `sync_addr` ArtDMX, ArtSync commits on `0x5200`; persisted in `SYNC_STATE` (0/1 unchanged); web `sync=0\|1\|2`; see [reqs/R33.md](reqs/R33.md), T18 |
 
 ### Art-Net & network
 
@@ -59,11 +61,12 @@ One row each. Use "shall". `Type`: F=function, Q=quality, C=constraint.
 |----|------|-------------|-----|------|------|-------|
 | R2 | F | The node shall receive Art-Net DMX over UDP on wired Ethernet (port 6454) | M | G1 | ☑ | `eth_task` |
 | R14 | F | The node shall obtain an IPv4 address via DHCP | M | G1 | ☑ | `ESP_NETIF_DEFAULT_ETH` DHCP client |
-| R15 | F | The node shall fall back to a link-local address when no DHCP is available | S | G1 | ☐ | not implemented; see T1 |
+| R15 | F | The node shall fall back to a link-local address when no DHCP is available | S | G1 | ☑ | **Done 2026-06-28.** `CONFIG_LWIP_AUTOIP=y` (in [sdkconfig.defaults](sdkconfig.defaults)) enables lwIP's cooperative DHCP+AUTOIP: DHCP keeps running, after `CONFIG_LWIP_AUTOIP_TRIES` (2) failed DISCOVERs the node self-assigns 169.254.x.x, and a later DHCP server takes over automatically. `got_ip_event_handler` also handles `IP_EVENT_ETH_LOST_IP` (zeroes `device_ip`) so the runtime address change is reflected in ArtPollReply. See T1 |
 | R16 | F | The node shall provide a 7-universe virtual patch, any universe routable to any output | M | G1 | ☑ | `DMX_patch` / `DMX_repatch`, fan-out supported |
 | R18 | F | The node shall respond to ArtPoll with ArtPollReply | S | G1 | ☑ | ArtPoll 0x2000 -> ArtPollReply 0x2100; since R22 the reply is fully populated (one bound port per output). The 0x6000/0x7000-as-poll quirk was removed (R22) — they now have their correct ArtAddress/ArtInput meaning |
 | R21 | Q | The Art-Net ingest path shall be bounds-checked and signed-safe | M | G3 | ☑ | see B1, B2 |
-| R22 | F | The node shall support native Art-Net output configuration and query (set per-output universe patch and node name via ArtAddress; report config in ArtPollReply) | S | G1 | ☑ | **Done 2026-06-26.** ArtPollReply reports all 7 outputs as bound ports (Art-Net 4 per-port binding, BindIndex 1..7, one universe per reply); ArtAddress (0x6000) sets per-output universe + node name, persisted via the stop/start+NVS handshake; the old 0x6000/0x7000 ArtPoll-trigger quirk removed (closes B12). ArtInput (0x7000) out of scope (output-only node). See [reqs/R22.md](reqs/R22.md), T7 |
+| R22 | F | The node shall support native Art-Net output configuration and query (set per-output universe patch via ArtAddress; report config in ArtPollReply) | S | G1 | ☑ | **Done 2026-06-26.** ArtPollReply reports all 7 outputs as bound ports (Art-Net 4 per-port binding, BindIndex 1..7, one universe per reply), advertising the derived short/long names; ArtAddress (0x6000) sets per-output universe, persisted via the stop/start+NVS handshake; the old 0x6000/0x7000 ArtPoll-trigger quirk removed (closes B12). **Node-name writes over ArtAddress removed (2026-06-28, R30):** the identity is now a single web-UI-only suffix, so ArtAddress is patch-only. ArtInput (0x7000) out of scope (output-only node). See [reqs/R22.md](reqs/R22.md), T7 |
+| R34 | F | The node shall set its network hostname, derived from the name suffix by a fixed prefix and sanitized to a valid DNS label | S | G6 | ☑ | **Done 2026-06-28.** `esp_netif_set_hostname()` with `"LF-ArtNetNode-"+suffix`; the suffix is sanitized to `[A-Za-z0-9-]` (other bytes → `-`, trailing `-` trimmed) so the label is always valid. Applied at boot and re-applied when the suffix changes (effective on next DHCP renew/reboot). Replaces the lwIP default `espressif`. See [reqs/R34.md](reqs/R34.md) |
 
 ### Configuration interfaces
 
@@ -73,10 +76,10 @@ One row each. Use "shall". `Type`: F=function, Q=quality, C=constraint.
 | R17 | F | ~~Patch and settings shall be configurable over the raw TCP interface~~ | M | G1 | ☑ | **Removed 2026-06-26** — superseded by R23. Same settings now configured via the web UI `/api/config` |
 | R23 | F | The node shall replace the TCP CLI with an interactive web UI exposing the same settings and live state | M | G6 | ☑ | Web UI on `esp_http_server` (port 80, core 0): `/`, `/api/state`, `/api/config`, `/api/ota`; reuses stop/start + NVS handshake. **TCP CLI removed 2026-06-26** (R4/R17 retired). See [reqs/R23.md](reqs/R23.md), T8 |
 | R27 | Q | The web UI shall be lightweight, fast-loading, and visually polished | S | G6 | ☑ | single self-contained page ~13 KB (config + live graphs + OTA upload), served from flash, no CDNs/libs (R7); responsive (mobile breakpoint, numeric keypads, native steppers); light/dark theme auto-follows the OS (`prefers-color-scheme`); per-field dirty highlighting + Reset, connection-health LED, name-edit dialog; [src/index.html](src/index.html) |
-| R30 | F | The web UI shall let the user view and edit the node short and long name | S | G6 | ☑ | **Done 2026-06-26.** Browser tab = short name, header = long name; pencil-icon dialog edits both; `/api/config` accepts `sname`/`lname` (URL-decoded) and persists via `save_node_name()`, the same NVS path as ArtAddress (R22). See [reqs/R30.md](reqs/R30.md), T15 |
+| R30 | F | The web UI shall let the user edit a single node-name *suffix*, from which the short name, long name, and hostname are derived by fixed prefixes | S | G6 | ☑ | **Reworked 2026-06-28.** User edits only the suffix (e.g. `Rack`); the node derives short `"LF "+suffix` (Art-Net ShortName, cap 17), long `"LICHTFETISCH ArtNet Node "+suffix` (LongName, cap 63), and hostname `"LF-ArtNetNode-"+suffix` (R34). Suffix capped at 14 (so the short name fits 17), persisted in NVS key `SUFFIX`; pencil-icon dialog edits it; `/api/config` accepts `suffix` (URL-decoded) via `save_node_name()`. Supersedes the prior free-form short/long-name editing. See [reqs/R30.md](reqs/R30.md), T15 |
 | R28 | F | The web UI shall display rolling 1-minute history graphs of Art-Net packet rate and DMX refresh rate, built client-side from periodic state polls (no on-device logging) | S | G6 | ☑ | firmware counts Art-Net packets/sec in `eth_task`, exposes it as `pps` in `/api/state`; graphs drawn client-side in [src/index.html](src/index.html). See [reqs/R28.md](reqs/R28.md), T13 |
 | R29 | F | The node shall measure and report core-0 CPU utilization, shown in the web UI as a live value and 1-minute history graph | S | G2 | ☑ | `stats_task` computes load from core-0 IDLE run-time over a 1 s window (FreeRTOS run-time stats); exposed as `load0` in `/api/state`, graphed client-side. Core 1 is unmeasurable by design (owns its core in a critical section). Needs `CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`. See [reqs/R29.md](reqs/R29.md), T14 |
-| R31 | Q | No value entered through the web UI shall be able to break the node (memory unsafety or malformed responses) | M | G3 | ☑ | **Done 2026-06-26.** `/api/state` names are JSON-escaped (`json_escape`, handles `"` `\` and control bytes); response buffers sized for worst-case escaping. Over-long query/values are rejected (httpd `TRUNC` ≠ `OK`); `sname`/`lname` `strncpy`-capped (17/63); `num_chan` clamped; `patch`/`sync_addr` are labels, never buffer indices. Web counterpart of R21. See T16 |
+| R31 | Q | No value entered through the web UI shall be able to break the node (memory unsafety or malformed responses) | M | G3 | ☑ | **Done 2026-06-26.** `/api/state` names are JSON-escaped (`json_escape`, handles `"` `\` and control bytes); response buffers sized for worst-case escaping. Over-long query/values are rejected (httpd `TRUNC` ≠ `OK`); the name `suffix` is `strncpy`-capped (14) and the derived names are bounded by their buffers (R30); `num_chan` clamped; `patch`/`sync_addr` are labels, never buffer indices. Web counterpart of R21. See T16 |
 
 ### Firmware update (OTA)
 
@@ -107,9 +110,7 @@ the deployed Olimex setup) is noted in the detail files.
 
 ### Open
 
-| ID | Bug | Ref | Sev | Done |
-|----|-----|-----|-----|------|
-| B11 | `num_chan` not clamped on NVS load | R12 | Lo | ☐ |
+*None.*
 
 Detail: [reqs/B11.md](reqs/B11.md), [reqs/B12.md](reqs/B12.md).
 
@@ -117,6 +118,7 @@ Detail: [reqs/B11.md](reqs/B11.md), [reqs/B12.md](reqs/B12.md).
 
 | ID | Area | Bug | Ref | Sev | Done | Resolution |
 |----|------|-----|-----|-----|------|------------|
+| B11 | NVS / boot | `num_chan` not clamped on NVS load: a stored value outside 1..512 (downgrade, corruption) made the frame-length math invalid | R12 | Lo | ☑ | Clamp `num_chan` to 1..512 in `load_sync_state` after load, same bounds as the setter |
 | B1 | Art-Net parse | Signed-`char` byte assembly sign-extends length/universe: huge `DMXlength` (heap overflow) or silently dropped universes | R21 | Hi | ☑ | Cast each byte to `uint8_t` before the shift/OR |
 | B2 | Art-Net parse | No `DMXlength` bound before `memcpy` | R21 | Hi | ☑ | Guard `recv_len >= 18`; clamp `DMXlength` to 512 then to `recv_len - 18` |
 | B3 | TCP parser | NULL `strtok` deref on separator-only or argument-less commands (remote DoS) | R17 | Hi | ☑ | Null-check first token; wrap each setter argument in `if (token != NULL)` |
@@ -132,10 +134,10 @@ Detail: [reqs/B11.md](reqs/B11.md), [reqs/B12.md](reqs/B12.md).
 
 ### By design
 
-**B5 — `update_dmx_ptr()` runs after `startDMX()`** (Ref R16, reviewed — not a defect)
-- Where: `save_dmx_patch` calls `startDMX()` before `update_dmx_ptr()` ([src/main.c:594](src/main.c#L594)), so the repatch runs while `dmx_task` is live.
-- Reviewed and confirmed memory-safe: `DMX_repatch[i]` is always in `[0,6]` and written atomically, so `dmx_task`'s `DMXbuf[512*DMX_repatch[i] + curchan-1]` stays in bounds whichever value wins the race; the `memset` only yields old-or-zero bytes. The stop/start window exists for the NVS write (flash-cache vs. the core-1 critical section), not the repatch. Only effect is a transient frame on re-patch.
-- Optional polish tracked as T6.
+**B5 — `update_dmx_ptr()` ran after `startDMX()`** (Ref R16, reviewed — not a defect; polished in T6)
+- Was: `save_dmx_patch` returned (calling `startDMX()`) before the callers ran `update_dmx_ptr()`, so the repatch + buffer clear ran while `dmx_task` was live.
+- Reviewed and confirmed memory-safe: `DMX_repatch[i]` is always in `[0,6]` and written atomically, so `dmx_task`'s `DMXbuf[512*DMX_repatch[i] + curchan-1]` stays in bounds whichever value wins the race; the `memset` only yields old-or-zero bytes. The stop/start window exists for the NVS write (flash-cache vs. the core-1 critical section), not the repatch. Only effect was a transient frame on re-patch.
+- **Polished (2026-06-28, T6):** `update_dmx_ptr()` now runs *inside* `save_dmx_patch`'s stop window (between the NVS write and `startDMX()`), and the two external calls were removed. The re-patch is now glitch-free — `dmx_task` is parked during the rebuild, so no transient/torn frame — and it runs even on NVS-open failure so the in-memory patch always takes effect.
 
 ## Todos
 
